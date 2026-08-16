@@ -1,6 +1,7 @@
 # AutoPrompter
 
-指定時刻に Claude Code セッションを自動起動し、プロンプトを投入するツール。
+指定時刻に Claude Code セッションを自動起動するか、すでに動いている
+tmux の Claude Code/Codex へプロンプトを投入するツール。
 レートリミットが回復するタイミングに仕事を仕込んでおき、枠を無駄にしないための道具。
 
 セッションは tmux の中で起動し、応答後も生きたまま残る。
@@ -8,17 +9,18 @@
 
 ## 仕組み
 
-```
-launchd (指定時刻に発火)
-   └─> runner.sh
-         └─> tmux new-session -d -s ap-<ジョブ名>
-               └─> cd <cwd> && claude --model .. --effort .. "<プロンプト>"
-                     (応答後もセッションは生存 → 後から attach)
+```text
+新規セッション:
+launchd → runner.sh → tmux new-session → claude <プロンプト>
+
+既存tmux:
+launchd → runner.sh → 対象paneの同一性・入力待ちを確認 → promptをpaste
 ```
 
-プロンプトは `claude` の位置引数として渡している。
-キー入力の模擬 (`tmux send-keys`) は使っていないので、
-起動タイミングやダイアログに影響されず確実に投入される。
+新規セッションではプロンプトを `claude` の位置引数として渡す。
+既存tmuxでは、対象paneが予約時と同じプロセスで、画面が静止し、最後の有効行が
+空の入力欄である場合だけtmux bufferから貼り付ける。生成中、入力途中、確認画面、
+shell待機中、別プロセスへ変化した場合は安全のため送信しない。
 
 ## セットアップ
 
@@ -30,7 +32,9 @@ export PATH="$PATH:/Users/masatoshibukawa/Documents/03_Scenario_based_HDDP/Scena
 
 反映は `source ~/.zshrc` か、ターミナルを開き直す。
 
-## 使い方を書く
+## 新しいClaude Codeセッションを起動する
+
+### 1. ジョブを書く
 
 `jobs/` に TOML を置く。[jobs/example.toml](jobs/example.toml) が雛形。
 
@@ -75,7 +79,64 @@ autoprompt attach dip_check  # セッションに合流して会話を続ける
 `attach` した後、抜けるには `Ctrl-b d` (tmux のデタッチ)。
 セッションは生きたままなので、また `attach` すれば戻れる。
 
-### レートリミットで止まったセッションを続ける
+## 既存tmuxへプロンプトを投入する
+
+### 対象paneを確認する
+
+```bash
+tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}  #{pane_id}'
+```
+
+`hddp:0.0` は「`hddp`セッションのwindow 0、pane 0」という意味。
+
+### 今すぐ投入する
+
+```bash
+autoprompt send hddp:0.0 "続きを実行してください"
+```
+
+長文や機密情報を含むプロンプトは、shell履歴へ本文を残さないようファイルを使う。
+
+```bash
+autoprompt send hddp:0.0 --prompt-file /path/to/prompt.txt
+```
+
+通常は、対象がClaude Code/Codexの空の入力待ちであると確認できた場合だけ送信する。
+状態を確認できない場合は何も送らずエラーになる。
+
+```bash
+autoprompt send hddp:0.0 --prompt-file /path/to/prompt.txt --force
+```
+
+`--force`は入力欄を消して置き換える。shell上ではプロンプトがコマンドとして
+実行される危険もあるため、対象paneを目視確認した場合だけ使用すること。
+
+### 指定時刻に投入する
+
+TOMLでは`cwd`の代わりに`tmux_target`を指定する。
+
+```toml
+name = "hddp-existing"
+tmux_target = "hddp:0.0"
+prompt_file = "/path/to/prompt.txt"
+on_rate_limit = "none"
+```
+
+```bash
+autoprompt add /path/to/job.toml --at "03:00"
+```
+
+登録時に対象を一意なpane IDへ解決し、PID、起動コマンド、現在のコマンド、
+session ID、window IDを保存する。実行時に1つでも変化していれば送信しない。
+予約時と実行時の両方でshell待機中のpaneを拒否する。
+
+既存tmuxの起動設定を引き継ぐため、`cwd`、`model`、`effort`、
+`permission_mode`は新たに適用されない。またwatchdogによる切り替えは対象外なので、
+`on_rate_limit = "none"`だけを使用できる。
+
+詳しい安全仕様は[TMUX_USAGE.txt](TMUX_USAGE.txt)にもまとめている。
+
+## AutoPrompter管理セッションを続ける
 
 Plan Max などで実行中にレートリミットに引っかかって止まったセッションは、
 tmux の中で生きたまま待機している。そこに続行プロンプトを投げる:
@@ -89,7 +150,7 @@ tmux セッションが既に終了している場合は使えない。その場
 `claude --continue` で新しいプロセスを起こして履歴から再開すること
 (セッションが tmux ごと消えている前提なので、AutoPrompter の外の操作になる)。
 
-### レートリミットを自動検知して対応する (watchdog)
+## レートリミットを自動検知して対応する (watchdog)
 
 「止まったのを見て手動で continue する」を、さらに自動化する機能。
 ジョブ TOML に `on_rate_limit` を指定したジョブだけが対象になる。
@@ -142,7 +203,7 @@ TOML に `on_rate_limit = "codex"` などと書いたのに watchdog 本体が
 に対応履歴が残り、同じジョブに二重に対応することはない。
 再度対象にしたい場合はこのファイルを削除する。
 
-### その他のコマンド
+## その他のコマンド
 
 ```bash
 autoprompt cancel dip_check  # 予約を取り消す
@@ -155,7 +216,8 @@ autoprompt run    jobs/x.toml # 予約せず即実行 (動作確認用)
 | 項目                         | 必須         | 値                                                                                       |
 | ---------------------------- | ------------ | ---------------------------------------------------------------------------------------- |
 | `name`                     | -            | ジョブ名。省略時はファイル名。英数字・ハイフン・アンダースコアのみ                       |
-| `cwd`                      | 必須         | 作業ディレクトリ。`~` 展開あり                                                         |
+| `cwd`                      | 新規時必須   | 新規Claudeセッションの作業ディレクトリ。`~` 展開あり                                  |
+| `tmux_target`              | 既存時必須   | 既存tmuxの対象。例: `hddp:0.0`。指定時は`cwd`不要                                    |
 | `prompt` / `prompt_file` | どちらか必須 | 投入するプロンプト                                                                       |
 | `model`                    | -            | `opus` / `sonnet` / `haiku` / `fable`、または `claude-opus-5` 等               |
 | `effort`                   | -            | `low` / `medium` / `high` / `xhigh` / `max`                                    |
@@ -163,6 +225,9 @@ autoprompt run    jobs/x.toml # 予約せず即実行 (動作確認用)
 | `auto_decide`              | -            | `true` にすると、選択肢を提示せず推奨案で進めるようプロンプトに自動で付け足す          |
 | `on_rate_limit`            | -            | `none`(既定) / `continue` / `codex`。レートリミット自動対応の挙動。詳細は下記      |
 | `rate_limit_threshold`     | -            | `on_rate_limit` が動き出す5時間枠の使用率(%)。既定 95                                  |
+
+`cwd`と`tmux_target`は動作モードを決める項目。新しいClaude Codeを起動するなら`cwd`、
+すでに動いているtmuxへ送るなら`tmux_target`を使う。
 
 ## 知っておくべき挙動
 
@@ -216,6 +281,9 @@ runner とログを `~/Library` 配下に置いているのは macOS の TCC 対
 launchd 経由のプロセスは `~/Documents` 配下のファイルを読めないため
 (実測: exit 127 `can't open input file`)。
 
+プロンプトの一時スナップショットは作成時から権限`0600`とし、runnerの成功・失敗・
+安全判定による中断のいずれでも削除する。実行可能なrunner本体へプロンプト本文は埋め込まない。
+
 ## トラブルシューティング
 
 **予約時刻になっても何も起きない**
@@ -238,6 +306,17 @@ tmux ls | grep ap-    # AutoPrompter のセッション一覧
 ```
 
 セッションが無ければ既に終了している。ログを確認する。
+
+**既存tmuxへの投入が拒否される**
+
+```bash
+tmux capture-pane -p -t hddp:0.0 | tail -30
+tmux display-message -p -t hddp:0.0 '#{pane_current_command}'
+```
+
+生成中、入力途中、確認ダイアログ、shell待機中、または予約後にpaneのプロセスが
+変わった場合は意図的に拒否する。作業完了後にもう一度実行するか、対象を確認して
+予約を登録し直す。
 
 ## レートリミット回復時刻の読み取り方(参考)
 
