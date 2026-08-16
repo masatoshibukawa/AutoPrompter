@@ -112,14 +112,76 @@ class ExistingTmuxJobTests(unittest.TestCase):
         ):
             self.assertFalse(autoprompt.tmux_target_is_idle("%12", samples=2))
 
-        historical_prompt = "❯\n" + "\n".join(
-            f"確認ダイアログ {index}" for index in range(12)
-        )
+        historical_prompt = "❯\n確認ダイアログ"
         with (
             patch.object(autoprompt, "tmux_capture", return_value=historical_prompt),
             patch.object(autoprompt.time, "sleep"),
         ):
             self.assertFalse(autoprompt.tmux_target_is_idle("%12", samples=2))
+
+    def test_runner_verifies_original_pane_process_identity(self) -> None:
+        job = autoprompt.Job(
+            {
+                "name": "identity",
+                "cwd": None,
+                "tmux_target": "research:1.2",
+                "prompt": "続けて",
+            },
+            self.root / "identity.toml",
+        )
+        state_directory = self.root / "identity-state"
+        log_directory = self.root / "identity-logs"
+        state_directory.mkdir()
+        log_directory.mkdir()
+        identity = {
+            "pane_id": "%12",
+            "pane_pid": "12345",
+            "pane_start_command": "claude",
+            "session_id": "$3",
+            "window_id": "@8",
+        }
+
+        with (
+            patch.object(autoprompt, "STATE_DIR", state_directory),
+            patch.object(autoprompt, "LOG_DIR", log_directory),
+        ):
+            runner = autoprompt.write_runner(job, tmux_identity=identity)
+            script = runner.read_text(encoding="utf-8")
+
+        self.assertIn("#{pane_pid}", script)
+        self.assertIn("#{pane_start_command}", script)
+        self.assertIn("#{session_id}", script)
+        self.assertIn("#{window_id}", script)
+        self.assertIn("%12|12345|claude|$3|@8", script)
+        self.assertIn('rm -f "$PROMPT"', script)
+        self.assertIn("autoprompt-identity-$$", script)
+
+    def test_new_session_runner_does_not_embed_prompt_in_executable_script(self) -> None:
+        secret_prompt = "TOP_SECRET_PROMPT"
+        job = autoprompt.Job(
+            {
+                "name": "new-session",
+                "cwd": self.root,
+                "prompt": secret_prompt,
+            },
+            self.root / "new-session.toml",
+        )
+        state_directory = self.root / "new-state"
+        log_directory = self.root / "new-logs"
+        state_directory.mkdir()
+        log_directory.mkdir()
+
+        with (
+            patch.object(autoprompt, "STATE_DIR", state_directory),
+            patch.object(autoprompt, "LOG_DIR", log_directory),
+        ):
+            runner = autoprompt.write_runner(job)
+            script = runner.read_text(encoding="utf-8")
+            prompt_snapshot = autoprompt.prompt_path_for(job.name)
+
+        self.assertNotIn(secret_prompt, script)
+        self.assertEqual(prompt_snapshot.read_text(encoding="utf-8"), secret_prompt)
+        self.assertEqual(stat.S_IMODE(prompt_snapshot.stat().st_mode), 0o600)
 
     def test_multiline_prompt_uses_one_unique_tmux_buffer(self) -> None:
         loaded_prompt = []
