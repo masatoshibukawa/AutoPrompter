@@ -1,0 +1,33 @@
+# 既存tmuxへ指定時刻にプロンプトを投入するサンプル
+#
+# 使い方:
+#   1. 対象paneを確認する
+#      tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}'
+#   2. 下の tmux_target と prompt を確認する
+#   3. 時刻を指定して予約する
+#      autoprompt add jobs/example-existing-tmux.toml --at "23:00"
+#   4. 予約を確認する
+#      autoprompt list
+
+# ジョブ名。launchdのLabelや状態ファイル名に使われる。
+name = "hddp-existing"
+
+# 投入先を session:window.pane 形式で指定する。
+# 現在の「hddp」セッションのwindow 0、pane 0を対象にする例。
+tmux_target = "hddp:0.0"
+
+# 投入するプロンプト。複数行を書ける。
+prompt = """
+現在の作業状況を確認し、中断した処理の続きを進めてください。
+"""
+
+# 長文はpromptの代わりにUTF-8ファイルから読み込める。
+# 相対パスは、このTOMLファイルがあるjobs/を基準に解決される。
+# promptとprompt_fileは同時に指定しないこと。
+# prompt_file = "../promtp/hddp.md"
+
+# 既存tmuxへの投入ではwatchdogによるClaude/Codex切り替えを行わない。
+on_rate_limit = "none"
+
+# 実行時に対象paneが生成中、入力途中、確認画面、shell待機中の場合や、
+# 予約後に別プロセスへ変わった場合は、安全のため送信せず終了する。

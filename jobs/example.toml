@@ -1,5 +1,9 @@
 # AutoPrompter ジョブ定義のサンプル
 #
+# このファイルは「新しいClaude Codeセッションを起動する」例。
+# すでに動いているtmuxへ時刻指定で投入する場合は、
+# jobs/example-existing-tmux.toml を使う。
+#
 # 使い方:
 #   autoprompt add jobs/example.toml --at "03:00"
 #   autoprompt list
