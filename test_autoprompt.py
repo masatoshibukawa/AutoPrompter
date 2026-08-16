@@ -70,6 +70,11 @@ class ExistingTmuxJobTests(unittest.TestCase):
         self.assertIn("display-message", script)
         self.assertIn("capture-pane", script)
         self.assertIn("paste-buffer", script)
+        self.assertIn("printf '%s\\n' \"$AFTER\"", script)
+        self.assertIn(
+            "printf '{\"name\":\"existing\",\"status\":\"sent\"",
+            script,
+        )
         self.assertNotIn("tmux new-session", script)
         self.assertNotIn("command -v claude", script)
         self.assertNotIn("1行目", script)
