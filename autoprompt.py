@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -111,6 +112,10 @@ def state_path_for(name: str) -> Path:
     return STATE_DIR / f"{name}.json"
 
 
+def prompt_path_for(name: str) -> Path:
+    return STATE_DIR / f"{name}.prompt.txt"
+
+
 def watchdog_state_path_for(name: str) -> Path:
     """ジョブごとの watchdog 対応履歴。同じ対応を繰り返さないための記録。"""
     return STATE_DIR / f"{name}.watchdog.json"
@@ -142,7 +147,8 @@ class Job:
     def __init__(self, data: dict, source: Path):
         self.source = source
         self.name: str = data["name"]
-        self.cwd: Path = data["cwd"]
+        self.cwd: Path | None = data.get("cwd")
+        self.tmux_target: str | None = data.get("tmux_target")
         self.model: str | None = data.get("model")
         self.effort: str | None = data.get("effort")
         self.permission_mode: str | None = data.get("permission_mode")
@@ -157,7 +163,10 @@ class Job:
             data.get("rate_limit_threshold", DEFAULT_RATE_LIMIT_THRESHOLD)
         )
 
-    def claude_argv(self) -> list[str]:
+    def prepared_prompt(self) -> str:
+        return self.prompt + AUTO_DECIDE_SUFFIX if self.auto_decide else self.prompt
+
+    def claude_argv(self, include_prompt: bool = True) -> list[str]:
         """`claude` 起動時のコマンドライン引数を組み立てる。
 
         -p は付けない。付けると応答後に即終了してしまい、
@@ -170,8 +179,8 @@ class Job:
             argv += ["--effort", self.effort]
         if self.permission_mode:
             argv += ["--permission-mode", self.permission_mode]
-        prompt = self.prompt + AUTO_DECIDE_SUFFIX if self.auto_decide else self.prompt
-        argv.append(prompt)
+        if include_prompt:
+            argv.append(self.prepared_prompt())
         return argv
 
 
@@ -190,13 +199,22 @@ def load_job(path: Path) -> Job:
     if not JOB_NAME_RE.match(name):
         die(f"name は英数字・ハイフン・アンダースコアのみ使えます: {name!r}")
 
-    # --- cwd ---
+    # --- tmux_target / cwd ---
+    raw_tmux_target = data.get("tmux_target")
+    tmux_target = str(raw_tmux_target).strip() if raw_tmux_target is not None else None
+    if raw_tmux_target is not None and not tmux_target:
+        die("tmux_target に空文字は指定できません")
+    if tmux_target and any(character in tmux_target for character in ("\n", "\r", "\0")):
+        die("tmux_target に改行やNUL文字は使えません")
+
     raw_cwd = data.get("cwd")
-    if not raw_cwd:
+    if not raw_cwd and not tmux_target:
         die("cwd は必須です (Claude を起動する作業ディレクトリ)")
-    cwd = Path(os.path.expanduser(str(raw_cwd))).resolve()
-    if not cwd.is_dir():
-        die(f"cwd が存在しないかディレクトリではありません: {cwd}")
+    cwd = None
+    if raw_cwd:
+        cwd = Path(os.path.expanduser(str(raw_cwd))).resolve()
+        if not cwd.is_dir():
+            die(f"cwd が存在しないかディレクトリではありません: {cwd}")
 
     # --- prompt / prompt_file ---
     prompt = data.get("prompt")
@@ -259,11 +277,14 @@ def load_job(path: Path) -> Job:
         die(f"rate_limit_threshold は整数で指定してください: {rate_limit_threshold!r}")
     if not (0 < rate_limit_threshold <= 100):
         die(f"rate_limit_threshold は 1〜100 の範囲で指定してください: {rate_limit_threshold}")
+    if tmux_target and on_rate_limit != "none":
+        die("tmux_target を使うジョブでは on_rate_limit='none' のみ指定できます")
 
     return Job(
         {
             "name": name,
             "cwd": cwd,
+            "tmux_target": tmux_target,
             "model": model,
             "effort": effort,
             "permission_mode": permission_mode,
@@ -335,6 +356,94 @@ def tmux_session_exists(session: str) -> bool:
     )
 
 
+def tmux_resolve_target(target: str) -> str | None:
+    """tmux targetを一意なpane IDへ解決する。見つからなければNone。"""
+    result = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", target, "#{pane_id}"],
+        capture_output=True,
+        text=True,
+    )
+    pane_id = result.stdout.strip()
+    if result.returncode != 0 or not re.fullmatch(r"%\d+", pane_id):
+        return None
+    return pane_id
+
+
+def tmux_target_exists(target: str) -> bool:
+    return tmux_resolve_target(target) is not None
+
+
+_EMPTY_AGENT_INPUT_RE = re.compile(r"^[❯›][ \t]*$", re.MULTILINE)
+
+
+def _has_recent_empty_agent_input(screen: str) -> bool:
+    lines = screen.splitlines()
+    nonempty_lines = [line for line in lines if line.strip()]
+    return bool(nonempty_lines and _EMPTY_AGENT_INPUT_RE.fullmatch(nonempty_lines[-1]))
+
+
+_TMUX_IDENTITY_FORMATS = {
+    "pane_id": "#{pane_id}",
+    "pane_pid": "#{pane_pid}",
+    "pane_start_command": "#{pane_start_command}",
+    "pane_current_command": "#{pane_current_command}",
+    "session_id": "#{session_id}",
+    "window_id": "#{window_id}",
+}
+
+_SHELL_COMMANDS = {"zsh", "bash", "fish", "sh", "dash"}
+
+
+def _is_shell_command(command: str | None) -> bool:
+    if not command:
+        return True
+    return Path(command).name.lstrip("-") in _SHELL_COMMANDS
+
+
+def tmux_target_identity(target: str) -> dict[str, str] | None:
+    """予約時のpaneとprocessを識別する値を取得する。"""
+    identity: dict[str, str] = {}
+    for name, tmux_format in _TMUX_IDENTITY_FORMATS.items():
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", target, tmux_format],
+            capture_output=True,
+            text=True,
+        )
+        value = result.stdout.strip()
+        allows_empty = name == "pane_start_command"
+        if result.returncode != 0 or (not value and not allows_empty):
+            return None
+        identity[name] = value
+    if not re.fullmatch(r"%\d+", identity["pane_id"]):
+        return None
+    if not identity["pane_pid"].isdigit():
+        return None
+    if not re.fullmatch(r"\$\d+", identity["session_id"]):
+        return None
+    if not re.fullmatch(r"@\d+", identity["window_id"]):
+        return None
+    if _is_shell_command(identity["pane_current_command"]):
+        return None
+    return identity
+
+
+def tmux_target_is_idle(target: str, samples: int = 3, interval: float = 2.0) -> bool:
+    """画面が静止し、Claude/Codexの入力欄が空ならTrueを返す。"""
+    previous_screen: str | None = None
+    for sample_index in range(samples):
+        screen = tmux_capture(target)
+        if previous_screen is not None and screen != previous_screen:
+            return False
+        previous_screen = screen
+        if sample_index < samples - 1:
+            time.sleep(interval)
+    return previous_screen is not None and _has_recent_empty_agent_input(previous_screen)
+
+
+def _tmux_prompt_text(prompt: str) -> str:
+    return "\\\n".join(prompt.split("\n"))
+
+
 def tmux_send_prompt(session: str, prompt: str) -> None:
     """生きている tmux セッションの入力欄にプロンプトを投入して送信する。
 
@@ -345,27 +454,38 @@ def tmux_send_prompt(session: str, prompt: str) -> None:
     """
     import tempfile
 
-    lines = prompt.split("\n")
-    literal_prompt = "\\\n".join(lines)
+    literal_prompt = _tmux_prompt_text(prompt)
+    buffer_name = f"autoprompt-{os.getpid()}-{uuid.uuid4().hex}"
 
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".txt", encoding="utf-8", delete=False
+    ) as f:
         f.write(literal_prompt)
         buf_path = f.name
 
+    buffer_loaded = False
     try:
         # 入力欄を確実に空にしてから貼り付ける。
-        subprocess.run(["tmux", "send-keys", "-t", session, "C-u"], check=False)
+        subprocess.run(["tmux", "send-keys", "-t", session, "C-u"], check=True)
         subprocess.run(
-            ["tmux", "load-buffer", "-b", "autoprompt", buf_path], check=True
+            ["tmux", "load-buffer", "-b", buffer_name, buf_path], check=True
         )
+        buffer_loaded = True
         subprocess.run(
-            ["tmux", "paste-buffer", "-d", "-b", "autoprompt", "-t", session],
+            ["tmux", "paste-buffer", "-d", "-b", buffer_name, "-t", session],
             check=True,
         )
+        buffer_loaded = False
         # 貼り付けの描画待ち。実測で必要だった待ち時間。
-        subprocess.run(["sleep", "1"])
-        subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=False)
+        time.sleep(1)
+        subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True)
     finally:
+        if buffer_loaded:
+            subprocess.run(
+                ["tmux", "delete-buffer", "-b", buffer_name],
+                check=False,
+                capture_output=True,
+            )
         Path(buf_path).unlink(missing_ok=True)
 
 
@@ -376,6 +496,16 @@ def tmux_capture(session: str) -> str:
         text=True,
     )
     return r.stdout
+
+
+def tmux_pane_current_command(target: str) -> str | None:
+    result = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", target, "#{pane_current_command}"],
+        capture_output=True,
+        text=True,
+    )
+    command = result.stdout.strip()
+    return command if result.returncode == 0 and command else None
 
 
 # --- セッション状態の判別(実測ベース) ---
@@ -532,23 +662,149 @@ def five_hour_utilization() -> tuple[float, datetime] | None:
 # ---------------------------------------------------------------------------
 
 
-def write_runner(job: Job) -> Path:
+def _write_private_text(path: Path, text: str) -> None:
+    """作成時点から0600の一時ファイルを書き、対象pathへ原子的に置換する。"""
+    import tempfile
+
+    file_descriptor, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(file_descriptor, 0o600)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as file:
+            file.write(text)
+        temporary_path.replace(path)
+    except BaseException:
+        try:
+            os.close(file_descriptor)
+        except OSError:
+            pass
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _write_existing_tmux_runner(job: Job, identity: dict[str, str]) -> Path:
+    """既存tmux paneへ安全に予約投入するrunnerを書き出す。"""
+    runner = STATE_DIR / f"{job.name}.runner.sh"
+    log_file = LOG_DIR / f"{job.name}.log"
+    prompt_snapshot = prompt_path_for(job.name)
+    _write_private_text(prompt_snapshot, _tmux_prompt_text(job.prepared_prompt()))
+
+    identity_names = (
+        "pane_id",
+        "pane_pid",
+        "pane_start_command",
+        "pane_current_command",
+        "session_id",
+        "window_id",
+    )
+    expected_identity = "|".join(identity[name] for name in identity_names)
+    quoted_target = shlex.quote(identity["pane_id"])
+    quoted_expected_identity = shlex.quote(expected_identity)
+    quoted_log = shlex.quote(str(log_file))
+    quoted_state = shlex.quote(str(state_path_for(job.name)))
+    quoted_prompt = shlex.quote(str(prompt_snapshot))
+
+    script = f"""#!/bin/zsh -l
+# AutoPrompter existing tmux runner (自動生成 - 直接編集しないこと)
+# ジョブ: {job.name}
+set -u
+
+LOG={quoted_log}
+STATE={quoted_state}
+TARGET={quoted_target}
+EXPECTED_IDENTITY={quoted_expected_identity}
+PROMPT={quoted_prompt}
+BUFFER=autoprompt-{job.name}-$$
+
+cleanup_artifacts() {{
+  tmux delete-buffer -b "$BUFFER" >/dev/null 2>&1 || true
+  rm -f "$PROMPT"
+}}
+trap cleanup_artifacts EXIT
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 既存tmux投入開始: {job.name}" >> "$LOG"
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 失敗: tmux が見つかりません" >> "$LOG"
+  exit 1
+fi
+
+PANE=$(tmux display-message -p -t "$TARGET" '#{{pane_id}}' 2>/dev/null)
+PANE_PID=$(tmux display-message -p -t "$TARGET" '#{{pane_pid}}' 2>/dev/null)
+PANE_START_COMMAND=$(tmux display-message -p -t "$TARGET" '#{{pane_start_command}}' 2>/dev/null)
+PANE_CURRENT_COMMAND=$(tmux display-message -p -t "$TARGET" '#{{pane_current_command}}' 2>/dev/null)
+SESSION_ID=$(tmux display-message -p -t "$TARGET" '#{{session_id}}' 2>/dev/null)
+WINDOW_ID=$(tmux display-message -p -t "$TARGET" '#{{window_id}}' 2>/dev/null)
+CURRENT_IDENTITY="$PANE|$PANE_PID|$PANE_START_COMMAND|$PANE_CURRENT_COMMAND|$SESSION_ID|$WINDOW_ID"
+if [ "$CURRENT_IDENTITY" != "$EXPECTED_IDENTITY" ]; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 失敗: 予約時と異なるtmux paneです: $TARGET" >> "$LOG"
+  exit 1
+fi
+
+BEFORE=$(tmux capture-pane -p -t "$PANE")
+sleep 2
+AFTER=$(tmux capture-pane -p -t "$PANE")
+if [ "$BEFORE" != "$AFTER" ] || ! printf '%s\\n' "$AFTER" | sed '/^[[:space:]]*$/d' | tail -n 1 | grep -Eq '^[❯›][[:space:]]*$'; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 中断: $PANE は生成中、入力済み、または入力待ちを確認できません" >> "$LOG"
+  printf '{{"name":"{job.name}","status":"blocked","mode":"existing_tmux","tmux_target":"%s","updated_at":"%s"}}' "$PANE" "$(date -Iseconds)" > "$STATE"
+  exit 1
+fi
+
+tmux send-keys -t "$PANE" C-u &&
+tmux load-buffer -b "$BUFFER" "$PROMPT" &&
+tmux paste-buffer -d -b "$BUFFER" -t "$PANE" &&
+sleep 1 &&
+tmux send-keys -t "$PANE" Enter
+rc=$?
+
+if [ $rc -eq 0 ]; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 投入成功: $PANE" >> "$LOG"
+  printf '{{"name":"{job.name}","status":"sent","mode":"existing_tmux","tmux_target":"%s","sent_at":"%s"}}' "$PANE" "$(date -Iseconds)" > "$STATE"
+else
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 失敗: tmux投入が rc=$rc で終了" >> "$LOG"
+  printf '{{"name":"{job.name}","status":"failed","mode":"existing_tmux","tmux_target":"%s","updated_at":"%s"}}' "$PANE" "$(date -Iseconds)" > "$STATE"
+fi
+
+exit $rc
+"""
+    runner.write_text(script, encoding="utf-8")
+    runner.chmod(0o755)
+    return runner
+
+
+def write_runner(
+    job: Job,
+    tmux_target: str | None = None,
+    tmux_identity: dict[str, str] | None = None,
+) -> Path:
     """ジョブを実行する shell スクリプトを書き出す。
 
     launchd から呼ばれるので PATH が最小限。ログインシェル(-l)で起動して
     ~/.local/bin などにパスを通す必要がある。
     """
+    target = tmux_target or job.tmux_target
+    if target:
+        identity = tmux_identity or tmux_target_identity(target)
+        if identity is None:
+            raise RuntimeError(f"tmux target {target!r} の同一性を確認できません")
+        return _write_existing_tmux_runner(job, identity)
+
     runner = STATE_DIR / f"{job.name}.runner.sh"
     session = session_for(job.name)
     log_file = LOG_DIR / f"{job.name}.log"
 
     # プロンプトや引数はシェルに解釈させたくないので、Python 側で安全に引用する。
 
-    claude_cmd = " ".join(shlex.quote(a) for a in job.claude_argv())
+    claude_cmd = " ".join(
+        shlex.quote(argument) for argument in job.claude_argv(include_prompt=False)
+    )
+    prompt_snapshot = prompt_path_for(job.name)
+    _write_private_text(prompt_snapshot, job.prepared_prompt())
     quoted_cwd = shlex.quote(str(job.cwd))
     quoted_session = shlex.quote(session)
     quoted_log = shlex.quote(str(log_file))
     quoted_state = shlex.quote(str(state_path_for(job.name)))
+    quoted_prompt = shlex.quote(str(prompt_snapshot))
 
     script = f"""#!/bin/zsh -l
 # AutoPrompter runner (自動生成 - 直接編集しないこと)
@@ -558,6 +814,12 @@ set -u
 LOG={quoted_log}
 SESSION={quoted_session}
 STATE={quoted_state}
+PROMPT={quoted_prompt}
+
+cleanup_prompt() {{
+  rm -f "$PROMPT"
+}}
+trap cleanup_prompt EXIT
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] ジョブ開始: {job.name}" >> "$LOG"
 
@@ -579,7 +841,7 @@ fi
 # -d でデタッチ起動。プロンプトは claude の位置引数として渡すので、
 # キー入力の模擬(send-keys)は一切不要。
 tmux new-session -d -s "$SESSION" -x 200 -y 50 -c {quoted_cwd} \\
-  {claude_cmd}
+  {claude_cmd} "$(cat "$PROMPT")"
 rc=$?
 
 if [ $rc -eq 0 ]; then
@@ -724,7 +986,7 @@ def watchdog_probe_and_react(name: str, job_dict: dict) -> None:
         return
 
     wd_state = load_watchdog_state(name)
-    if wd_state.get("phase") in ("tried_continue", "handed_to_codex"):
+    if wd_state.get("phase") in ("tried_continue", "handed_to_codex", "handoff_failed"):
         return  # 既に一度対応済み。二度手間・二重投入を避ける
 
     # 本当に止まっているか(名残スピナーに惑わされないか)を確認してから動く。
@@ -757,11 +1019,44 @@ def watchdog_probe_and_react(name: str, job_dict: dict) -> None:
         return
 
     if on_rate_limit == "codex":
-        handoff_to_codex(name, session)
-        save_watchdog_state(name, {"phase": "handed_to_codex", "at": datetime.now().isoformat()})
+        succeeded = handoff_to_codex(name, session)
+        phase = "handed_to_codex" if succeeded else "handoff_failed"
+        save_watchdog_state(name, {"phase": phase, "at": datetime.now().isoformat()})
 
 
-def handoff_to_codex(name: str, session: str) -> None:
+def _write_codex_handoff_runner(name: str, prompt: str) -> Path:
+    prompt_path = STATE_DIR / f"{name}.handoff.prompt.txt"
+    runner_path = STATE_DIR / f"{name}.handoff.runner.sh"
+    _write_private_text(prompt_path, prompt)
+    quoted_prompt_path = shlex.quote(str(prompt_path))
+    script = f"""#!/bin/zsh -l
+set -u
+PROMPT={quoted_prompt_path}
+cleanup_prompt() {{
+  rm -f "$PROMPT"
+}}
+trap cleanup_prompt EXIT
+HANDOFF_PROMPT=$(cat "$PROMPT")
+rm -f "$PROMPT"
+trap - EXIT
+rm -f "$0"
+exec codex "$HANDOFF_PROMPT"
+"""
+    _write_private_text(runner_path, script)
+    runner_path.chmod(0o700)
+    return runner_path
+
+
+def _cleanup_codex_handoff_files(name: str, runner: Path | None = None) -> None:
+    (STATE_DIR / f"{name}.handoff.prompt.txt").unlink(missing_ok=True)
+    (runner or STATE_DIR / f"{name}.handoff.runner.sh").unlink(missing_ok=True)
+
+
+def _is_codex_command(command: str | None) -> bool:
+    return bool(command and Path(command).name.lower().startswith("codex"))
+
+
+def handoff_to_codex(name: str, session: str) -> bool:
     """tmux セッション内の claude を終え、直近の状況を要約したプロンプトで
     同じセッション内に codex を起動する。会話の器(tmux セッション)は
     維持したまま、中身のツールだけ切り替えるイメージ。
@@ -778,14 +1073,45 @@ def handoff_to_codex(name: str, session: str) -> None:
         "--- ここまで ---\n"
     )
 
-    watchdog_log(f"{name}: Codex に引き継ぎます")
-    tmux_send_prompt(session, "exit")  # claude を終了させる(-> シェルに戻る)
-    time.sleep(2)
-    subprocess.run(
-        ["tmux", "send-keys", "-t", session, "-l", f"codex {handoff_prompt!r}"],
-        check=False,
-    )
-    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=False)
+    watchdog_log(f"{name}: Claudeを終了し、Codexへの引き継ぎを開始します")
+    tmux_send_prompt(session, "/exit")
+
+    shell_commands = {"zsh", "bash", "fish", "sh", "dash"}
+    for _ in range(10):
+        time.sleep(1)
+        if tmux_pane_current_command(session) in shell_commands:
+            break
+    else:
+        watchdog_log(f"{name}: Claudeの終了を確認できないため、Codex起動を中断しました")
+        return False
+
+    try:
+        runner = _write_codex_handoff_runner(name, handoff_prompt)
+    except OSError as error:
+        _cleanup_codex_handoff_files(name)
+        watchdog_log(f"{name}: Codex runnerの作成に失敗しました: {error}")
+        return False
+    command = f"exec {shlex.quote(str(runner))}"
+    try:
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session, "-l", command],
+            check=True,
+        )
+        subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        _cleanup_codex_handoff_files(name, runner)
+        watchdog_log(f"{name}: Codex runnerの投入に失敗しました: {error}")
+        return False
+
+    for _ in range(10):
+        time.sleep(1)
+        if _is_codex_command(tmux_pane_current_command(session)):
+            watchdog_log(f"{name}: Codexの起動を確認しました")
+            return True
+
+    _cleanup_codex_handoff_files(name, runner)
+    watchdog_log(f"{name}: Codexの起動を確認できなかったため引き継ぎ失敗とします")
+    return False
 
 
 def run_watchdog_cycle() -> None:
@@ -821,6 +1147,14 @@ def run_watchdog_cycle() -> None:
 def warn_job_caveats(job: Job) -> None:
     """ジョブ登録・実行の前に、知っておくべき挙動を知らせる。"""
 
+    if job.tmux_target and any(
+        value is not None for value in (job.model, job.effort, job.permission_mode)
+    ):
+        warn(
+            "tmux_targetを使うジョブではmodel/effort/permission_modeは使われません。"
+            "既存セッションの起動時設定がそのまま使われます。"
+        )
+
     # 見ていない間に無確認でファイル変更・コマンド実行を許す設定。止めはしない。
     if job.permission_mode in RISKY_PERMISSION_MODES:
         warn(
@@ -848,25 +1182,31 @@ def cmd_add(args: argparse.Namespace) -> None:
 
     warn_job_caveats(job)
 
-    # 未信頼ディレクトリだと起動時の確認ダイアログで止まり、無人実行が空振りする。
-    trusted = is_trusted_dir(job.cwd)
-    if trusted is False:
-        warn(
-            f"{job.cwd} は Claude Code の信頼済みディレクトリではないようです。\n"
-            "  そのままだと起動時の確認ダイアログで止まり、ジョブが空振りします。\n"
-            f"  先に一度 `cd {job.cwd} && claude` を手動実行して承認しておいてください。"
-        )
-    elif trusted is None:
-        warn("信頼済みディレクトリかどうか判定できませんでした（起動時に確認が出る可能性があります）")
-
+    resolved_target = None
     session = session_for(job.name)
-    if tmux_session_exists(session):
-        die(
-            f"tmux セッション {session} が既に存在します。\n"
-            f"  先に `autoprompt kill {job.name}` で片付けるか、別の name にしてください。"
-        )
+    if job.tmux_target:
+        resolved_target = tmux_resolve_target(job.tmux_target)
+        if resolved_target is None:
+            die(f"tmux target {job.tmux_target!r} が見つかりません")
+    else:
+        # 未信頼ディレクトリだと起動時の確認ダイアログで止まり、無人実行が空振りする。
+        trusted = is_trusted_dir(job.cwd)  # type: ignore[arg-type]
+        if trusted is False:
+            warn(
+                f"{job.cwd} は Claude Code の信頼済みディレクトリではないようです。\n"
+                "  そのままだと起動時の確認ダイアログで止まり、ジョブが空振りします。\n"
+                f"  先に一度 `cd {job.cwd} && claude` を手動実行して承認しておいてください。"
+            )
+        elif trusted is None:
+            warn("信頼済みディレクトリかどうか判定できませんでした（起動時に確認が出る可能性があります）")
 
-    runner = write_runner(job)
+        if tmux_session_exists(session):
+            die(
+                f"tmux セッション {session} が既に存在します。\n"
+                f"  先に `autoprompt kill {job.name}` で片付けるか、別の name にしてください。"
+            )
+
+    runner = write_runner(job, resolved_target)
     plist = write_plist(job, runner, when)
     launchctl_bootstrap(plist)
 
@@ -877,11 +1217,13 @@ def cmd_add(args: argparse.Namespace) -> None:
                 "status": "scheduled",
                 "scheduled_for": when.isoformat(),
                 "job_file": str(job.source),
-                "cwd": str(job.cwd),
+                "mode": "existing_tmux" if resolved_target else "new_session",
+                "cwd": str(job.cwd) if job.cwd else None,
                 "model": job.model,
                 "effort": job.effort,
                 "permission_mode": job.permission_mode,
-                "session": session,
+                "session": session if not resolved_target else None,
+                "tmux_target": resolved_target,
                 "on_rate_limit": job.on_rate_limit,
                 "rate_limit_threshold": job.rate_limit_threshold,
             },
@@ -893,14 +1235,18 @@ def cmd_add(args: argparse.Namespace) -> None:
 
     print(f"予約しました: {job.name}")
     print(f"  実行時刻   : {when:%Y-%m-%d %H:%M}")
-    print(f"  作業ディレクトリ: {job.cwd}")
-    print(f"  モデル/effort  : {job.model or '(既定)'} / {job.effort or '(既定)'}")
-    print(f"  権限モード : {job.permission_mode or '(既定: 毎回確認)'}")
-    print(f"  合流方法   : autoprompt attach {job.name}")
+    if resolved_target:
+        print(f"  投入先     : {job.tmux_target} -> {resolved_target}")
+        print(f"  内容       : {len(job.prepared_prompt())}文字（本文は表示しません）")
+    else:
+        print(f"  作業ディレクトリ: {job.cwd}")
+        print(f"  モデル/effort  : {job.model or '(既定)'} / {job.effort or '(既定)'}")
+        print(f"  権限モード : {job.permission_mode or '(既定: 毎回確認)'}")
+        print(f"  合流方法   : autoprompt attach {job.name}")
 
     # on_rate_limit を設定したのに watchdog 本体が動いていないと、
     # 閾値を超えても誰も見ておらず引き継ぎが発火しない。取りこぼし防止で自動起動する。
-    if job.on_rate_limit != "none" and ensure_watchdog_running():
+    if not resolved_target and job.on_rate_limit != "none" and ensure_watchdog_running():
         print(f"  watchdog   : 未起動だったため自動起動しました({WATCHDOG_INTERVAL_MINUTES}分おき巡回)")
 
 
@@ -985,6 +1331,44 @@ def cmd_continue(args: argparse.Namespace) -> None:
     print(f"  確認: autoprompt attach {args.name}")
 
 
+def _prompt_from_args(args: argparse.Namespace) -> str:
+    if args.prompt and args.prompt_file:
+        die("promptと--prompt-fileは同時に指定できません")
+    if args.prompt_file:
+        prompt_path = Path(os.path.expanduser(args.prompt_file)).resolve()
+        if not prompt_path.is_file():
+            die(f"prompt_fileが見つかりません: {prompt_path}")
+        prompt = prompt_path.read_text(encoding="utf-8")
+    else:
+        prompt = args.prompt
+    if not prompt or not prompt.strip():
+        die("中身のあるpromptまたは--prompt-fileを指定してください")
+    return prompt.strip()
+
+
+def cmd_send(args: argparse.Namespace) -> None:
+    """AutoPrompter管理外を含む既存tmux paneへ直接送信する。"""
+    prompt = _prompt_from_args(args)
+    pane_id = tmux_resolve_target(args.target)
+    if pane_id is None:
+        die(f"tmux target {args.target!r} が見つかりません")
+    if not args.force:
+        initial_command = tmux_pane_current_command(pane_id)
+        if _is_shell_command(initial_command):
+            die(f"{pane_id}はshell待機中のため、プロンプトをコマンドとして送信しません")
+        if not tmux_target_is_idle(pane_id):
+            die(
+                f"{pane_id}が空の入力待ちであることを確認できません。"
+                "生成中や入力途中の可能性があります。確認後、必要なら--forceを指定してください"
+            )
+        final_command = tmux_pane_current_command(pane_id)
+        final_screen = tmux_capture(pane_id)
+        if final_command != initial_command or not _has_recent_empty_agent_input(final_screen):
+            die(f"{pane_id}の状態が確認中に変化したため、送信を中止しました")
+    tmux_send_prompt(pane_id, prompt)
+    print(f"投入しました: {args.target} -> {pane_id}（{len(prompt)}文字）")
+
+
 def cmd_cancel(args: argparse.Namespace) -> None:
     ensure_dirs()
     name = args.name
@@ -998,6 +1382,7 @@ def cmd_cancel(args: argparse.Namespace) -> None:
 
     runner = STATE_DIR / f"{name}.runner.sh"
     runner.unlink(missing_ok=True)
+    prompt_path_for(name).unlink(missing_ok=True)
     state_path_for(name).unlink(missing_ok=True)
 
     print(f"予約を取り消しました: {name}")
@@ -1023,17 +1408,26 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     warn_job_caveats(job)
 
-    session = session_for(job.name)
-    if tmux_session_exists(session):
-        die(f"tmux セッション {session} が既に存在します")
+    resolved_target = None
+    if job.tmux_target:
+        resolved_target = tmux_resolve_target(job.tmux_target)
+        if resolved_target is None:
+            die(f"tmux target {job.tmux_target!r} が見つかりません")
+    else:
+        session = session_for(job.name)
+        if tmux_session_exists(session):
+            die(f"tmux セッション {session} が既に存在します")
 
-    runner = write_runner(job)
+    runner = write_runner(job, resolved_target)
     r = subprocess.run([str(runner)], capture_output=True, text=True)
     if r.returncode != 0:
         die(f"実行に失敗しました (rc={r.returncode})\n{r.stdout}\n{r.stderr}")
 
-    print(f"起動しました: {job.name}")
-    print(f"  合流方法: autoprompt attach {job.name}")
+    if resolved_target:
+        print(f"投入しました: {job.tmux_target} -> {resolved_target}")
+    else:
+        print(f"起動しました: {job.name}")
+        print(f"  合流方法: autoprompt attach {job.name}")
 
 
 def watchdog_plist_path() -> Path:
@@ -1175,6 +1569,23 @@ def main() -> None:
         help='投げるプロンプト。省略すると "続けて"',
     )
     p_continue.set_defaults(func=cmd_continue)
+
+    p_send = sub.add_parser(
+        "send", help="既存のtmux session/window/paneへプロンプトを投入する"
+    )
+    p_send.add_argument("target", help="tmux target。例: hddp:0.0")
+    p_send.add_argument("prompt", nargs="?", default=None, help="投入するプロンプト")
+    p_send.add_argument(
+        "--prompt-file",
+        default=None,
+        help="投入内容をUTF-8ファイルから読む（長文・機密情報向け）",
+    )
+    p_send.add_argument(
+        "--force",
+        action="store_true",
+        help="生成中・入力途中の可能性があっても入力欄を置換して送る",
+    )
+    p_send.set_defaults(func=cmd_send)
 
     p_cancel = sub.add_parser("cancel", help="予約を取り消す")
     p_cancel.add_argument("name", help="ジョブ名")

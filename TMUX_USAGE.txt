@@ -1,0 +1,38 @@
+既存tmuxへのプロンプト投入
+============================
+
+1. tmuxの対象を確認する
+
+  tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}  #{pane_id}'
+
+2. 今すぐ投入する
+
+  autoprompt send hddp:0.0 "続きを実行してください"
+
+長文はコマンド履歴へ本文を残さないよう、UTF-8ファイルを使う。
+
+  autoprompt send hddp:0.0 --prompt-file /path/to/prompt.txt
+
+通常は画面が静止し、Claude CodeまたはCodexの入力欄が空のときだけ投入する。
+生成中・入力途中・状態不明の場合は停止する。--forceは入力欄を消して置換するため、
+対象paneを目視確認した場合だけ使用する。
+
+3. 指定時刻に既存paneへ投入する
+
+ジョブTOMLではcwdの代わりにtmux_targetを指定する。
+
+  name = "hddp-existing"
+  tmux_target = "hddp:0.0"
+  prompt_file = "/path/to/prompt.txt"
+  on_rate_limit = "none"
+
+  autoprompt add /path/to/job.toml --at "03:00"
+
+登録時に対象を一意なpane ID（%12など）へ固定し、paneのPID、起動コマンド、session ID、
+window IDも保存する。そのため、予約後にactive paneが変わった場合や、同じ番号のpaneが
+別プロセスとして作り直された場合は送信しない。実行時にも画面が静止し、最後の有効行が
+空の入力欄であることを再確認する。条件を満たさなければstatus=blockedとして終了する。
+
+既存セッションを利用するため、model、effort、permission_mode、cwdは新たに適用されない。
+そのセッションを起動したときの設定が使われる。既存tmux向けジョブではwatchdogによる
+Claude/Codex切り替えは行わないため、on_rate_limitはnoneだけを使用できる。
