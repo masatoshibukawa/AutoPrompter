@@ -1,0 +1,66 @@
+# AutoPrompter ジョブ定義のサンプル
+#
+# 使い方:
+#   autoprompt add jobs/example.toml --at "03:00"
+#   autoprompt list
+#   autoprompt attach example
+
+# ジョブ名。tmux セッション名 (ap-example) と launchd の Label に使われる。
+# 英数字・ハイフン・アンダースコアのみ。
+name = "example"
+
+# Claude を起動する作業ディレクトリ。
+# ここが「どのリポジトリで作業するか」を決める。~ は展開される。
+#
+# 注意: このディレクトリは事前に Claude Code で一度開いて信頼を承認しておくこと。
+#       未承認だと起動時に確認ダイアログで止まり、無人実行が空振りする。
+cwd = "~/Documents/03_Scenario_based_HDDP/Scenario_based_HDDP_worktrees/SDDP_ver4.1"
+
+# モデル。opus / sonnet / haiku / fable のエイリアス、
+# または claude-opus-5 のようなフルネーム。省略すると既定値。
+#
+# 注意: permission_mode = "plan" と併用すると、この指定は効かない。
+#       プランモードは計画立案のため Claude Code が内部で上位モデルに
+#       切り替えるため(実測確認済み)。登録時に autoprompt が警告する。
+model = "opus"
+
+# reasoning effort。low / medium / high / xhigh / max。省略すると既定値。
+#
+# 注意: claude 本体は不正値を警告だけ出して黙って既定値に落とすため、
+#       autoprompt 側で事前に検証してタイポを弾いている。
+effort = "high"
+
+# 権限モード。省略すると既定(毎回確認)。
+#   manual            … 毎回確認 (既定)
+#   plan              … プランモードで起動
+#   acceptEdits       … ファイル編集を自動承認
+#   dontAsk           … 確認しない
+#   bypassPermissions … 全チェックをバイパス
+#
+# 警告: acceptEdits / dontAsk / bypassPermissions は、まさとが見ていない間に
+#       Claude が無確認でファイルを書き換え、コマンドを実行することを意味する。
+#       深夜の無人実行で使う場合はリスクを理解した上で選ぶこと。
+#       登録時に autoprompt が警告を出す。
+permission_mode = "plan"
+
+# true にすると、選択肢を提示せず推奨案で進めるようプロンプト末尾に
+# 自動で指示を付け足す。無人実行中に選択待ちで止まるのを防ぐ。
+# ただし UI の選択ダイアログを自動クリックする仕組みではなく、
+# Claude 自身に「選択肢を出さないでね」と頼むだけなので絶対ではない。
+auto_decide = true
+
+# 投入するプロンプト。複数行可。
+# スキル系スラッシュコマンド (/goal, /plan など) もそのまま書ける。
+prompt = """
+/goal DIP の t=30 が収束すること
+
+resampling.jl の keep_rows まわりを調査して、
+前向き計算と微分で確率ゼロ点の除外条件が食い違っている箇所を特定してほしい。
+まずは調査だけで、コードの変更はまだしないこと。
+"""
+
+# prompt の代わりに外部ファイルから読み込むこともできる。
+# 相対パスはこの TOML ファイルの場所からの相対。
+# prompt と prompt_file は同時に指定できない。
+#
+# prompt_file = "./prompts/dip_investigation.md"

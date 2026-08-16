@@ -1,0 +1,4 @@
+#!/bin/zsh -l
+# autoprompt ラッパー
+# PATH を通しておけば、どこからでも `autoprompt ...` で呼べる。
+exec /opt/homebrew/bin/python3 "${0:A:h}/autoprompt.py" "$@"
