@@ -103,6 +103,18 @@ class ExistingTmuxJobTests(unittest.TestCase):
             text=True,
         )
 
+    def test_tmux_identity_allows_empty_start_command_for_manual_session(self) -> None:
+        outputs = ["%12\n", "12345\n", "\n", "2.1.233\n", "$3\n", "@8\n"]
+        completed = [
+            subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+            for output in outputs
+        ]
+        with patch.object(autoprompt.subprocess, "run", side_effect=completed):
+            identity = autoprompt.tmux_target_identity("research:1.2")
+
+        self.assertIsNotNone(identity)
+        self.assertEqual(identity["pane_start_command"], "")
+
     def test_idle_check_requires_static_empty_agent_input(self) -> None:
         with (
             patch.object(autoprompt, "tmux_capture", side_effect=["❯  \n", "❯  \n"]),
