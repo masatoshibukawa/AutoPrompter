@@ -80,7 +80,7 @@ class ExistingTmuxJobTests(unittest.TestCase):
             force=False,
         )
         with (
-            patch.object(autoprompt, "tmux_target_exists", return_value=True),
+            patch.object(autoprompt, "tmux_resolve_target", return_value="%7"),
             patch.object(autoprompt, "tmux_target_is_idle", return_value=False),
             patch.object(autoprompt, "tmux_send_prompt") as send_prompt,
             self.assertRaises(SystemExit),
@@ -90,11 +90,11 @@ class ExistingTmuxJobTests(unittest.TestCase):
 
         args.force = True
         with (
-            patch.object(autoprompt, "tmux_target_exists", return_value=True),
+            patch.object(autoprompt, "tmux_resolve_target", return_value="%7"),
             patch.object(autoprompt, "tmux_send_prompt") as send_prompt,
         ):
             autoprompt.cmd_send(args)
-        send_prompt.assert_called_once_with("research:1.2", "続けて")
+        send_prompt.assert_called_once_with("%7", "続けて")
 
 
 if __name__ == "__main__":
