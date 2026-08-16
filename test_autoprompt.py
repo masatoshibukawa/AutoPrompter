@@ -68,6 +68,7 @@ class ExistingTmuxJobTests(unittest.TestCase):
                     "pane_id": "%12",
                     "pane_pid": "12345",
                     "pane_start_command": "claude",
+                    "pane_current_command": "2.1.233",
                     "session_id": "$3",
                     "window_id": "@8",
                 },
@@ -105,9 +106,10 @@ class ExistingTmuxJobTests(unittest.TestCase):
     def test_idle_check_requires_static_empty_agent_input(self) -> None:
         with (
             patch.object(autoprompt, "tmux_capture", side_effect=["❯  \n", "❯  \n"]),
-            patch.object(autoprompt.time, "sleep"),
+            patch.object(autoprompt.time, "sleep") as sleep,
         ):
             self.assertTrue(autoprompt.tmux_target_is_idle("%12", samples=2))
+        self.assertEqual(sleep.call_count, 1)
 
         with (
             patch.object(autoprompt, "tmux_capture", side_effect=["❯\n", "working\n"]),
@@ -146,6 +148,7 @@ class ExistingTmuxJobTests(unittest.TestCase):
             "pane_id": "%12",
             "pane_pid": "12345",
             "pane_start_command": "claude",
+            "pane_current_command": "2.1.233",
             "session_id": "$3",
             "window_id": "@8",
         }
@@ -159,9 +162,10 @@ class ExistingTmuxJobTests(unittest.TestCase):
 
         self.assertIn("#{pane_pid}", script)
         self.assertIn("#{pane_start_command}", script)
+        self.assertIn("#{pane_current_command}", script)
         self.assertIn("#{session_id}", script)
         self.assertIn("#{window_id}", script)
-        self.assertIn("%12|12345|claude|$3|@8", script)
+        self.assertIn("%12|12345|claude|2.1.233|$3|@8", script)
         self.assertIn('rm -f "$PROMPT"', script)
         self.assertIn("autoprompt-identity-$$", script)
 
@@ -224,6 +228,7 @@ class ExistingTmuxJobTests(unittest.TestCase):
         with (
             patch.object(autoprompt, "tmux_resolve_target", return_value="%7"),
             patch.object(autoprompt, "tmux_target_is_idle", return_value=False),
+            patch.object(autoprompt, "tmux_pane_current_command", return_value="2.1.233"),
             patch.object(autoprompt, "tmux_send_prompt") as send_prompt,
             self.assertRaises(SystemExit),
         ):
@@ -233,10 +238,22 @@ class ExistingTmuxJobTests(unittest.TestCase):
         args.force = True
         with (
             patch.object(autoprompt, "tmux_resolve_target", return_value="%7"),
+            patch.object(autoprompt, "tmux_pane_current_command", return_value="zsh"),
             patch.object(autoprompt, "tmux_send_prompt") as send_prompt,
         ):
             autoprompt.cmd_send(args)
         send_prompt.assert_called_once_with("%7", "続けて")
+
+        args.force = False
+        with (
+            patch.object(autoprompt, "tmux_resolve_target", return_value="%7"),
+            patch.object(autoprompt, "tmux_pane_current_command", return_value="zsh"),
+            patch.object(autoprompt, "tmux_target_is_idle", return_value=True),
+            patch.object(autoprompt, "tmux_send_prompt") as send_prompt,
+            self.assertRaises(SystemExit),
+        ):
+            autoprompt.cmd_send(args)
+        send_prompt.assert_not_called()
 
     def test_codex_handoff_never_embeds_captured_screen_in_shell_command(self) -> None:
         captured_screen = "malicious $(touch /tmp/should-not-run) ' \"\n"
@@ -244,7 +261,11 @@ class ExistingTmuxJobTests(unittest.TestCase):
         with (
             patch.object(autoprompt, "tmux_capture", return_value=captured_screen),
             patch.object(autoprompt, "tmux_send_prompt") as send_prompt,
-            patch.object(autoprompt, "tmux_pane_current_command", return_value="zsh"),
+            patch.object(
+                autoprompt,
+                "tmux_pane_current_command",
+                side_effect=["zsh", "codex"],
+            ),
             patch.object(
                 autoprompt,
                 "_write_codex_handoff_runner",
@@ -262,6 +283,35 @@ class ExistingTmuxJobTests(unittest.TestCase):
         self.assertEqual(literal_command, f"exec {safe_runner}")
         self.assertNotIn(captured_screen, literal_command)
 
+    def test_codex_handoff_reports_failure_when_codex_does_not_start(self) -> None:
+        safe_runner = self.root / "handoff.runner.sh"
+        safe_runner.write_text("runner", encoding="utf-8")
+        prompt_path = self.root / "job.handoff.prompt.txt"
+        prompt_path.write_text("prompt", encoding="utf-8")
+        with (
+            patch.object(autoprompt, "tmux_capture", return_value="screen"),
+            patch.object(autoprompt, "tmux_send_prompt"),
+            patch.object(
+                autoprompt,
+                "tmux_pane_current_command",
+                side_effect=["zsh", *("zsh" for _ in range(10))],
+            ),
+            patch.object(
+                autoprompt,
+                "_write_codex_handoff_runner",
+                return_value=safe_runner,
+            ),
+            patch.object(autoprompt.subprocess, "run"),
+            patch.object(autoprompt.time, "sleep"),
+            patch.object(autoprompt, "STATE_DIR", self.root),
+            patch.object(autoprompt, "watchdog_log"),
+        ):
+            result = autoprompt.handoff_to_codex("job", "%12")
+
+        self.assertFalse(result)
+        self.assertFalse(safe_runner.exists())
+        self.assertFalse(prompt_path.exists())
+
     def test_codex_handoff_stops_if_claude_does_not_exit(self) -> None:
         with (
             patch.object(autoprompt, "tmux_capture", return_value="screen"),
@@ -275,6 +325,19 @@ class ExistingTmuxJobTests(unittest.TestCase):
 
         self.assertFalse(result)
         run.assert_not_called()
+
+    def test_codex_handoff_runner_keeps_screen_content_out_of_script(self) -> None:
+        prompt = "screen content $(dangerous) ' \""
+        state_directory = self.root / "handoff-state"
+        state_directory.mkdir()
+        with patch.object(autoprompt, "STATE_DIR", state_directory):
+            runner = autoprompt._write_codex_handoff_runner("job", prompt)
+            prompt_path = state_directory / "job.handoff.prompt.txt"
+
+        self.assertNotIn(prompt, runner.read_text(encoding="utf-8"))
+        self.assertEqual(prompt_path.read_text(encoding="utf-8"), prompt)
+        self.assertEqual(stat.S_IMODE(prompt_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(runner.stat().st_mode), 0o700)
 
 
 if __name__ == "__main__":
