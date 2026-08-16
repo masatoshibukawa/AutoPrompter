@@ -1,4 +1,6 @@
 import argparse
+import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,7 +72,62 @@ class ExistingTmuxJobTests(unittest.TestCase):
         self.assertIn("paste-buffer", script)
         self.assertNotIn("tmux new-session", script)
         self.assertNotIn("command -v claude", script)
+        self.assertNotIn("1行目", script)
         self.assertEqual(prompt_snapshot.read_text(encoding="utf-8"), "1行目\\\n2行目")
+        self.assertEqual(stat.S_IMODE(prompt_snapshot.stat().st_mode), 0o600)
+
+    def test_tmux_target_is_resolved_to_stable_pane_id(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, stdout="%12\n", stderr="")
+        with patch.object(autoprompt.subprocess, "run", return_value=completed) as run:
+            pane_id = autoprompt.tmux_resolve_target("research:1.2")
+
+        self.assertEqual(pane_id, "%12")
+        run.assert_called_once_with(
+            ["tmux", "display-message", "-p", "-t", "research:1.2", "#{pane_id}"],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_idle_check_requires_static_empty_agent_input(self) -> None:
+        with (
+            patch.object(autoprompt, "tmux_capture", side_effect=["❯  \n", "❯  \n"]),
+            patch.object(autoprompt.time, "sleep"),
+        ):
+            self.assertTrue(autoprompt.tmux_target_is_idle("%12", samples=2))
+
+        with (
+            patch.object(autoprompt, "tmux_capture", side_effect=["❯\n", "working\n"]),
+            patch.object(autoprompt.time, "sleep"),
+        ):
+            self.assertFalse(autoprompt.tmux_target_is_idle("%12", samples=2))
+
+        with (
+            patch.object(autoprompt, "tmux_capture", return_value="❯ 下書き\n"),
+            patch.object(autoprompt.time, "sleep"),
+        ):
+            self.assertFalse(autoprompt.tmux_target_is_idle("%12", samples=2))
+
+    def test_multiline_prompt_uses_one_unique_tmux_buffer(self) -> None:
+        loaded_prompt = []
+
+        def capture_load_buffer(command: list[str], **_: object) -> subprocess.CompletedProcess:
+            if command[1] == "load-buffer":
+                loaded_prompt.append(Path(command[-1]).read_text(encoding="utf-8"))
+            return subprocess.CompletedProcess(command, 0)
+
+        with (
+            patch.object(autoprompt.subprocess, "run", side_effect=capture_load_buffer) as run,
+            patch.object(autoprompt.time, "sleep"),
+        ):
+            autoprompt.tmux_send_prompt("%12", "1行目\n2行目")
+
+        commands = [call.args[0] for call in run.call_args_list]
+        load_command = next(command for command in commands if command[1] == "load-buffer")
+        paste_command = next(command for command in commands if command[1] == "paste-buffer")
+        self.assertEqual(loaded_prompt, ["1行目\\\n2行目"])
+        self.assertTrue(load_command[3].startswith("autoprompt-"))
+        self.assertEqual(load_command[3], paste_command[4])
+        self.assertEqual(commands[-1], ["tmux", "send-keys", "-t", "%12", "Enter"])
 
     def test_cmd_send_requires_idle_target_unless_forced(self) -> None:
         args = argparse.Namespace(
