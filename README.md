@@ -89,6 +89,59 @@ tmux セッションが既に終了している場合は使えない。その場
 `claude --continue` で新しいプロセスを起こして履歴から再開すること
 (セッションが tmux ごと消えている前提なので、AutoPrompter の外の操作になる)。
 
+### レートリミットを自動検知して対応する (watchdog)
+
+「止まったのを見て手動で continue する」を、さらに自動化する機能。
+ジョブ TOML に `on_rate_limit` を指定したジョブだけが対象になる。
+
+```toml
+on_rate_limit = "codex"      # none(既定) / continue / codex
+rate_limit_threshold = 95    # 使用率何%で動き出すか(既定95)
+```
+
+| 値              | 動作                                                                                                                                                                    |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `none` (既定) | 何もしない。今まで通り手動で`continue` する                                                                                                                           |
+| `continue`    | 閾値を超えて実際にセッションが止まっていたら、ログに記録する。実際の続行はまさとが手動で`autoprompt continue` する                                                    |
+| `codex`       | 同上に加えて、続行を試みても応答がなければ**Codex に引き継ぐ**。同じ tmux セッションの中で `claude` を終え、直前の画面の抜粋を渡した状態で `codex` を起動する |
+
+監視デーモンの起動・停止:
+
+```bash
+autoprompt watchdog-start   # 5分おきの巡回を開始 (launchd に登録)
+autoprompt watchdog-status  # 稼働状況と現在の使用率を確認
+autoprompt watchdog-stop    # 停止
+```
+
+**`autoprompt add` 時の自動起動**: `on_rate_limit` を `none` 以外にした
+ジョブを `add` すると、watchdog がまだ起動していなければ自動で起動する。
+TOML に `on_rate_limit = "codex"` などと書いたのに watchdog 本体が
+未起動で引き継ぎが発火しない、という取りこぼしを防ぐための挙動。
+明示的に `watchdog-start` を打つ必要はない(打っても害はない)。
+
+**動作の仕組み**: 5分おきに `~/.claude.json` の実際の使用率を見て、閾値を
+超えていて、かつ対象ジョブの tmux セッションが**本当に静止している**
+(数秒間画面が一切変化しない)場合だけ動く。まず軽い試し打ちを送り、
+応答があれば「リミットはまだ生きている」と判断してそこで止まる。
+応答が無ければ `on_rate_limit` の設定に従う。
+
+**閾値を95%にしている理由**: 100%ギリギリまで待つと、Codexへの引き継ぎ
+処理そのものを実行するトークンすら残っていない可能性がある。かといって
+閾値を下げすぎると、まだ十分使える枠を早々と手放すことになる。
+「95%で試し打ち、ダメならすぐ最小構成で切り替える」という2段構えに
+することで、閾値の精密さそのものへの依存を減らしている。
+
+**やらないこと**: 信頼確認ダイアログなど、レートリミット以外の理由で
+セッションが止まっている場合は判別できないため、何もしない。
+ダイアログを自動で承認・突破する処理は一切実装していない
+(セキュリティ上、意図的に入れていない)。判別できない停止は
+まさとが `autoprompt attach` して自分の目で見て判断すること。
+
+**一度対応したジョブは再度触らない**: 試し打ちを送った後は
+`~/Library/Application Support/AutoPrompter/state/<name>.watchdog.json`
+に対応履歴が残り、同じジョブに二重に対応することはない。
+再度対象にしたい場合はこのファイルを削除する。
+
 ### その他のコマンド
 
 ```bash
@@ -108,6 +161,8 @@ autoprompt run    jobs/x.toml # 予約せず即実行 (動作確認用)
 | `effort`                   | -            | `low` / `medium` / `high` / `xhigh` / `max`                                    |
 | `permission_mode`          | -            | `manual` / `plan` / `auto` / `acceptEdits` / `dontAsk` / `bypassPermissions` |
 | `auto_decide`              | -            | `true` にすると、選択肢を提示せず推奨案で進めるようプロンプトに自動で付け足す          |
+| `on_rate_limit`            | -            | `none`(既定) / `continue` / `codex`。レートリミット自動対応の挙動。詳細は下記      |
+| `rate_limit_threshold`     | -            | `on_rate_limit` が動き出す5時間枠の使用率(%)。既定 95                                  |
 
 ## 知っておくべき挙動
 
@@ -184,14 +239,19 @@ tmux ls | grep ap-    # AutoPrompter のセッション一覧
 
 セッションが無ければ既に終了している。ログを確認する。
 
-## 今後の拡張余地
+## レートリミット回復時刻の読み取り方(参考)
 
-レートリミット回復時刻は、以下から読み取れることを確認済み。
-これを使えば「リミットが回復したら自動投入」も実装できる。
-
-- `~/.claude.json` の `cachedUsageUtilization.utilization.five_hour.resets_at` (ISO8601, 5分TTL)
-- statusLine フックに渡される JSON の `rate_limits.five_hour.resets_at` (Unix秒, 対話セッション中のみ)
-
+watchdog は `~/.claude.json` の `cachedUsageUtilization` を使っている。
 サーバが返す実際の値なので、「到達時刻 + 5時間」のような推定は不要。
 
+- `~/.claude.json` の `cachedUsageUtilization.utilization.five_hour.resets_at` (ISO8601, 5分TTL)
+- statusLine フックに渡される JSON の `rate_limits.five_hour.resets_at` (Unix秒, 対話セッション中のみ、watchdog は未使用)
+
 注意: `~/.claude.json` は設定本体。読み取り専用で扱うこと (書き込むと全設定が壊れる)。
+
+## 今後の拡張余地
+
+- watchdog は現状 AutoPrompter が起こしたジョブのみが対象。まさとが
+  普段使っている VSCode 内のメインセッションは tmux の外で動いているため、
+  同じ方式では対応できない(別の実現方法が必要)
+- 信頼確認ダイアログ等、レートリミット以外の理由での停止検知は未対応

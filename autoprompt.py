@@ -13,9 +13,11 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -57,6 +59,22 @@ RISKY_PERMISSION_MODES = {"bypassPermissions", "dontAsk", "acceptEdits"}
 
 JOB_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
+# --- watchdog (レートリミット自動対応) ---
+
+VALID_ON_RATE_LIMIT = {"none", "continue", "codex"}
+
+# 5時間枠の使用率がこの値(%)以上になったら watchdog が動き出す。
+# 高すぎると試し打ちすら通らないほど枠が尽きた後になるリスクがあり、
+# 低すぎるとまだ余裕があるうちに Codex へ切り替えてしまう。
+# 「試し打ちが失敗すれば要約なしで即 Codex に切り替える」という
+# 2段構えを前提に、やや保守的な値を既定にしている。
+DEFAULT_RATE_LIMIT_THRESHOLD = 95
+
+# 何分おきに使用率とセッション状態を確認するか。
+WATCHDOG_INTERVAL_MINUTES = 5
+
+WATCHDOG_LABEL = f"{LABEL_PREFIX}.watchdog"
+
 
 # ---------------------------------------------------------------------------
 # 小物
@@ -93,6 +111,11 @@ def state_path_for(name: str) -> Path:
     return STATE_DIR / f"{name}.json"
 
 
+def watchdog_state_path_for(name: str) -> Path:
+    """ジョブごとの watchdog 対応履歴。同じ対応を繰り返さないための記録。"""
+    return STATE_DIR / f"{name}.watchdog.json"
+
+
 def gui_domain() -> str:
     return f"gui/{os.getuid()}"
 
@@ -125,6 +148,14 @@ class Job:
         self.permission_mode: str | None = data.get("permission_mode")
         self.prompt: str = data["prompt"]
         self.auto_decide: bool = bool(data.get("auto_decide", False))
+        # レートリミット時の挙動。
+        #   none      … 何もしない(既定)。まさとが手動で判断する
+        #   continue  … 使用率が閾値を超えたら watchdog が自動で continue を試みる
+        #   codex     … continue を試みて失敗したら Codex に引き継ぐ
+        self.on_rate_limit: str = data.get("on_rate_limit", "none")
+        self.rate_limit_threshold: int = int(
+            data.get("rate_limit_threshold", DEFAULT_RATE_LIMIT_THRESHOLD)
+        )
 
     def claude_argv(self) -> list[str]:
         """`claude` 起動時のコマンドライン引数を組み立てる。
@@ -214,6 +245,21 @@ def load_job(path: Path) -> Job:
                 f"有効値: {sorted(VALID_PERMISSION_MODES)}"
             )
 
+    # --- on_rate_limit / rate_limit_threshold ---
+    on_rate_limit = data.get("on_rate_limit", "none")
+    if on_rate_limit not in VALID_ON_RATE_LIMIT:
+        die(
+            f"on_rate_limit={on_rate_limit!r} は無効です。"
+            f"有効値: {sorted(VALID_ON_RATE_LIMIT)}"
+        )
+    rate_limit_threshold = data.get("rate_limit_threshold", DEFAULT_RATE_LIMIT_THRESHOLD)
+    try:
+        rate_limit_threshold = int(rate_limit_threshold)
+    except (TypeError, ValueError):
+        die(f"rate_limit_threshold は整数で指定してください: {rate_limit_threshold!r}")
+    if not (0 < rate_limit_threshold <= 100):
+        die(f"rate_limit_threshold は 1〜100 の範囲で指定してください: {rate_limit_threshold}")
+
     return Job(
         {
             "name": name,
@@ -223,6 +269,8 @@ def load_job(path: Path) -> Job:
             "permission_mode": permission_mode,
             "prompt": prompt,
             "auto_decide": data.get("auto_decide", False),
+            "on_rate_limit": on_rate_limit,
+            "rate_limit_threshold": rate_limit_threshold,
         },
         path,
     )
@@ -321,6 +369,94 @@ def tmux_send_prompt(session: str, prompt: str) -> None:
         Path(buf_path).unlink(missing_ok=True)
 
 
+def tmux_capture(session: str) -> str:
+    r = subprocess.run(
+        ["tmux", "capture-pane", "-p", "-t", session],
+        capture_output=True,
+        text=True,
+    )
+    return r.stdout
+
+
+# --- セッション状態の判別(実測ベース) ---
+#
+# 応答中は「記号 + 動詞 + for Ns / for 1m Ns / …」という形式のスピナー行が出る。
+# 例: "✻ Crunched for 13s" "✽ Warping…"。記号・動詞はランダムに変わるため
+# 固定文字列ではなく形式でマッチする。長い本文出力でスピナー行が画面外に
+# 押し出されることがあるため、これ単体で「無ければアイドル」とは断定しない。
+#
+# 行末は [ \t]*$ で改行を跨がないようにしている。\s*$ にすると
+# tmux capture-pane が返す末尾の空行の連なりに引きずられて、
+# スクロールバッファの上の方に残った「過去の」スピナー行まで
+# マッチしてしまう(実測で確認した誤判定の原因)。
+_SPINNER_RE = re.compile(
+    r"^[✻✢✽✶·]\s.*(…|for \d+(s|m \d+s))[ \t]*$", re.MULTILINE
+)
+
+# claude 本体が内部で使っているのと同じキーフレーズ(strings調査で確認)。
+_RATE_LIMIT_RE = re.compile(
+    r"usage limit reached|usage credit limit|out of usage credits|"
+    r"close to your.*usage limit|Approaching.*usage limit",
+    re.IGNORECASE,
+)
+
+
+def tmux_session_state(session: str, screen: str | None = None) -> str:
+    """tmux セッションの現在状態を推定する(単発サンプルのみで判定)。
+
+    戻り値: "generating"(応答中) / "rate_limited"(リミット表示あり) /
+            "idle"(入力待ちらしい) / "unknown"(判別つかず)
+
+    注意: 応答完了直後は「✻ Brewed for 5s」のようなスピナー行の名残が
+    画面に残ったまま入力欄が空になる(実測で確認)。この関数はスピナー行の
+    "有無" しか見ないため、名残と本当に生成中の状態を区別できない。
+    区別が要る場面では tmux_session_is_idle() を使うこと。
+
+    信頼確認ダイアログ等、レートリミット以外の理由で止まっている場合の
+    区別も付けない(= "unknown" になりうる)。watchdog はそれを検知しても
+    何もせず、まさとの判断に委ねる方針にしている。ダイアログを自動で
+    閉じたり承認したりする処理はここには一切含めない。
+    """
+    if screen is None:
+        screen = tmux_capture(session)
+
+    if _RATE_LIMIT_RE.search(screen):
+        return "rate_limited"
+    if _SPINNER_RE.search(screen):
+        return "generating"
+    if "❯" in screen:
+        return "idle"
+
+    return "unknown"
+
+
+def tmux_session_is_idle(session: str, samples: int = 3, interval: float = 2.0) -> bool:
+    """複数回サンプリングして、確実にアイドル(入力待ち)と言えるかを判定する。
+
+    単発の tmux_session_state() だけでは2種類の誤判定がありうる
+    (いずれも実測で確認済み):
+      1. スピナー出現前の一瞬や出力の切れ目で "idle" と早合点する
+      2. 応答完了直後、スピナー行の名残(秒数が止まったまま)が残っていて
+         "generating" と誤認し続ける
+
+    どちらも「画面が完全に静止しているか」を見れば解決する。応答中は
+    スピナーが動くか本文が流れるかで必ず capture-pane の出力が変わり続け、
+    名残のスピナー行は数字も含めて完全に固定される。そのため判定基準は
+    「レートリミット表示が無い」かつ「画面が samples 回・interval 秒間隔で
+    一切変化しない」に統一する(スピナー行の有無そのものでは判定しない)。
+    """
+    prev_screen: str | None = None
+    for _ in range(samples):
+        screen = tmux_capture(session)
+        if _RATE_LIMIT_RE.search(screen):
+            return False
+        if prev_screen is not None and screen != prev_screen:
+            return False
+        prev_screen = screen
+        time.sleep(interval)
+    return prev_screen is not None and "❯" in prev_screen
+
+
 # ---------------------------------------------------------------------------
 # 信頼済みディレクトリの確認
 # ---------------------------------------------------------------------------
@@ -359,6 +495,39 @@ def is_trusted_dir(cwd: Path) -> bool | None:
 
 
 # ---------------------------------------------------------------------------
+# レートリミット使用率の取得
+# ---------------------------------------------------------------------------
+
+
+def five_hour_utilization() -> tuple[float, datetime] | None:
+    """5時間枠の使用率(%)と回復時刻を返す。
+
+    ~/.claude.json の cachedUsageUtilization を読む。サーバが返した実際の値で、
+    CLI が起動している間は5分TTLで更新される。設定本体なので読むだけで、
+    絶対に書き込まない。
+
+    戻り値: (使用率0-100, 回復時刻) / 取得できなければ None
+    """
+    cfg = Path.home() / ".claude.json"
+    if not cfg.exists():
+        return None
+    try:
+        with cfg.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    try:
+        five_hour = data["cachedUsageUtilization"]["utilization"]["five_hour"]
+        utilization = float(five_hour["utilization"])
+        resets_at = datetime.fromisoformat(five_hour["resets_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    return utilization, resets_at
+
+
+# ---------------------------------------------------------------------------
 # runner スクリプトの生成
 # ---------------------------------------------------------------------------
 
@@ -374,7 +543,6 @@ def write_runner(job: Job) -> Path:
     log_file = LOG_DIR / f"{job.name}.log"
 
     # プロンプトや引数はシェルに解釈させたくないので、Python 側で安全に引用する。
-    import shlex
 
     claude_cmd = " ".join(shlex.quote(a) for a in job.claude_argv())
     quoted_cwd = shlex.quote(str(job.cwd))
@@ -502,6 +670,150 @@ def scheduled_jobs() -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
+# watchdog (レートリミット自動対応)
+# ---------------------------------------------------------------------------
+#
+# 動作の流れ (on_rate_limit != "none" のジョブのみ対象):
+#   1. 5時間枠の使用率が rate_limit_threshold(既定95%)を超えている
+#   2. かつ、そのジョブの tmux セッションが本当に止まっている(idle)
+#      -> レートリミットで止まったと推定して「試し打ち」を送る
+#   3. 試し打ちに応答があれば、リミットは実は回復している。何もしない
+#      (会話は続いているので、まさとが後で attach すればよい)
+#   4. 試し打ちに応答がなければ、on_rate_limit の設定に従う:
+#        "continue" -> ログに記録するだけ(まさとの手動 continue を待つ)
+#        "codex"    -> Codex に引き継ぐ
+#
+# ダイアログ等レートリミット以外の理由で止まっている場合は判別できない
+# ("unknown" 状態は無視して何もしない)。これは意図的な安全側の判断。
+
+
+def load_watchdog_state(name: str) -> dict:
+    p = watchdog_state_path_for(name)
+    if not p.exists():
+        return {"phase": "watching"}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"phase": "watching"}
+
+
+def save_watchdog_state(name: str, state: dict) -> None:
+    watchdog_state_path_for(name).write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def watchdog_log(msg: str) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}\n"
+    with (LOG_DIR / "watchdog.log").open("a", encoding="utf-8") as f:
+        f.write(line)
+
+
+_PROBE_PROMPT = "watchdog: これが読めていたら「OK」とだけ返してください。"
+
+
+def watchdog_probe_and_react(name: str, job_dict: dict) -> None:
+    """1ジョブぶんの試し打ち〜対応を行う。job_dict は state/<name>.json の中身。"""
+    session = session_for(name)
+    if not tmux_session_exists(session):
+        return  # セッションが無ければ watchdog の対象外
+
+    on_rate_limit = job_dict.get("on_rate_limit", "none")
+    if on_rate_limit == "none":
+        return
+
+    wd_state = load_watchdog_state(name)
+    if wd_state.get("phase") in ("tried_continue", "handed_to_codex"):
+        return  # 既に一度対応済み。二度手間・二重投入を避ける
+
+    # 本当に止まっているか(名残スピナーに惑わされないか)を確認してから動く。
+    if not tmux_session_is_idle(session, samples=3, interval=2.0):
+        return
+
+    watchdog_log(f"{name}: 閾値超過かつアイドル検知。試し打ちを送ります")
+    tmux_send_prompt(session, _PROBE_PROMPT)
+
+    # 試し打ちへの応答を少し待つ。応答が始まればすぐ画面が動くはず。
+    responded = False
+    for _ in range(6):
+        time.sleep(5)
+        if tmux_session_state(session) in ("generating", "idle"):
+            screen = tmux_capture(session)
+            if "OK" in screen.split(_PROBE_PROMPT)[-1]:
+                responded = True
+                break
+
+    if responded:
+        watchdog_log(f"{name}: 試し打ちに応答あり。リミットは回復している様子。継続")
+        save_watchdog_state(name, {"phase": "watching"})
+        return
+
+    watchdog_log(f"{name}: 試し打ちに応答なし。on_rate_limit={on_rate_limit!r} に従います")
+
+    if on_rate_limit == "continue":
+        save_watchdog_state(name, {"phase": "tried_continue", "at": datetime.now().isoformat()})
+        watchdog_log(f"{name}: continue 設定のため記録のみ。まさとの手動対応を待ちます")
+        return
+
+    if on_rate_limit == "codex":
+        handoff_to_codex(name, session)
+        save_watchdog_state(name, {"phase": "handed_to_codex", "at": datetime.now().isoformat()})
+
+
+def handoff_to_codex(name: str, session: str) -> None:
+    """tmux セッション内の claude を終え、直近の状況を要約したプロンプトで
+    同じセッション内に codex を起動する。会話の器(tmux セッション)は
+    維持したまま、中身のツールだけ切り替えるイメージ。
+    """
+    screen = tmux_capture(session)
+    tail = "\n".join(screen.splitlines()[-60:])  # 直近の文脈のみ渡す
+
+    handoff_prompt = (
+        "これは Claude Code がレートリミットで停止したため、Codex に引き継がれた"
+        "作業です。以下は直前の画面の抜粋です。状況を把握したうえで、"
+        "妥当と思われる続きを進めてください。\n\n"
+        "--- 直前の画面(抜粋) ---\n"
+        f"{tail}\n"
+        "--- ここまで ---\n"
+    )
+
+    watchdog_log(f"{name}: Codex に引き継ぎます")
+    tmux_send_prompt(session, "exit")  # claude を終了させる(-> シェルに戻る)
+    time.sleep(2)
+    subprocess.run(
+        ["tmux", "send-keys", "-t", session, "-l", f"codex {handoff_prompt!r}"],
+        check=False,
+    )
+    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=False)
+
+
+def run_watchdog_cycle() -> None:
+    """全ジョブを1周チェックする。launchd から定期的に呼ばれる想定。"""
+    ensure_dirs()
+    result = five_hour_utilization()
+    if result is None:
+        watchdog_log("使用率を取得できませんでした。~/.claude.json 未整備の可能性")
+        return
+    utilization, resets_at = result
+
+    for state_file in STATE_DIR.glob("*.json"):
+        if state_file.name.endswith(".watchdog.json"):
+            continue
+        try:
+            job_dict = json.loads(state_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        name = job_dict.get("name")
+        if not name:
+            continue
+        threshold = job_dict.get("rate_limit_threshold", DEFAULT_RATE_LIMIT_THRESHOLD)
+        if utilization < threshold:
+            continue
+        watchdog_probe_and_react(name, job_dict)
+
+
+# ---------------------------------------------------------------------------
 # サブコマンド
 # ---------------------------------------------------------------------------
 
@@ -570,6 +882,8 @@ def cmd_add(args: argparse.Namespace) -> None:
                 "effort": job.effort,
                 "permission_mode": job.permission_mode,
                 "session": session,
+                "on_rate_limit": job.on_rate_limit,
+                "rate_limit_threshold": job.rate_limit_threshold,
             },
             ensure_ascii=False,
             indent=2,
@@ -583,6 +897,11 @@ def cmd_add(args: argparse.Namespace) -> None:
     print(f"  モデル/effort  : {job.model or '(既定)'} / {job.effort or '(既定)'}")
     print(f"  権限モード : {job.permission_mode or '(既定: 毎回確認)'}")
     print(f"  合流方法   : autoprompt attach {job.name}")
+
+    # on_rate_limit を設定したのに watchdog 本体が動いていないと、
+    # 閾値を超えても誰も見ておらず引き継ぎが発火しない。取りこぼし防止で自動起動する。
+    if job.on_rate_limit != "none" and ensure_watchdog_running():
+        print(f"  watchdog   : 未起動だったため自動起動しました({WATCHDOG_INTERVAL_MINUTES}分おき巡回)")
 
 
 def cmd_list(args: argparse.Namespace) -> None:
@@ -717,6 +1036,106 @@ def cmd_run(args: argparse.Namespace) -> None:
     print(f"  合流方法: autoprompt attach {job.name}")
 
 
+def watchdog_plist_path() -> Path:
+    return LAUNCH_AGENTS_DIR / f"{WATCHDOG_LABEL}.plist"
+
+
+def watchdog_is_running() -> bool:
+    r = subprocess.run(
+        ["launchctl", "print", f"{gui_domain()}/{WATCHDOG_LABEL}"],
+        capture_output=True,
+        text=True,
+    )
+    return r.returncode == 0
+
+
+def start_watchdog() -> None:
+    """定期監視(watchdog)を launchd に登録して起動する(内部処理本体)。"""
+    ensure_dirs()
+    LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # launchd から直接 python を起動すると PATH が最小限のままで、
+    # tmux/claude を command -v で見つけられずに毎回失敗する(実測: exit 1)。
+    # runner.sh と同様、ログインシェル(-l)経由にして PATH を解決させる。
+    python_cmd = " ".join(shlex.quote(a) for a in (sys.executable, str(Path(__file__).resolve()), "watchdog-cycle"))
+    plist = {
+        "Label": WATCHDOG_LABEL,
+        "ProgramArguments": ["/bin/zsh", "-l", "-c", python_cmd],
+        "StartInterval": WATCHDOG_INTERVAL_MINUTES * 60,
+        "RunAtLoad": True,
+        "StandardOutPath": str(LOG_DIR / "watchdog.launchd.out.log"),
+        "StandardErrorPath": str(LOG_DIR / "watchdog.launchd.err.log"),
+    }
+    path = watchdog_plist_path()
+    with path.open("wb") as f:
+        plistlib.dump(plist, f)
+
+    subprocess.run(["launchctl", "bootout", f"{gui_domain()}/{WATCHDOG_LABEL}"], capture_output=True)
+    r = subprocess.run(
+        ["launchctl", "bootstrap", gui_domain(), str(path)], capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        die(f"launchctl bootstrap に失敗しました:\n{r.stderr.strip()}")
+
+
+def ensure_watchdog_running() -> bool:
+    """watchdog が未起動なら起動する。実際に起動した場合は True を返す。
+
+    on_rate_limit を設定したジョブを add したのに watchdog 本体が
+    起動しておらず引き継ぎが発火しない、という取りこぼしを防ぐための
+    自動起動。既に稼働中なら何もしない(二重登録は launchctl 側で
+    bootout してから bootstrap するので安全だが、無駄なログ出力を避ける)。
+    """
+    if watchdog_is_running():
+        return False
+    start_watchdog()
+    return True
+
+
+def cmd_watchdog_start(args: argparse.Namespace) -> None:
+    start_watchdog()
+    print(f"watchdog を起動しました({WATCHDOG_INTERVAL_MINUTES}分おきに巡回)")
+    print("  on_rate_limit を設定したジョブのみが対象です。")
+    print(f"  ログ: {LOG_DIR / 'watchdog.log'}")
+
+
+def cmd_watchdog_stop(args: argparse.Namespace) -> None:
+    r = subprocess.run(
+        ["launchctl", "bootout", f"{gui_domain()}/{WATCHDOG_LABEL}"], capture_output=True
+    )
+    watchdog_plist_path().unlink(missing_ok=True)
+    if r.returncode == 0:
+        print("watchdog を停止しました")
+    else:
+        print("watchdog は登録されていませんでした")
+
+
+def cmd_watchdog_status(args: argparse.Namespace) -> None:
+    if not watchdog_is_running():
+        print("watchdog は停止しています(未登録)")
+        return
+    r = subprocess.run(
+        ["launchctl", "print", f"{gui_domain()}/{WATCHDOG_LABEL}"],
+        capture_output=True,
+        text=True,
+    )
+    print("watchdog は稼働中です")
+    for line in r.stdout.splitlines():
+        if any(k in line for k in ("state =", "runs =", "last exit")):
+            print(f"  {line.strip()}")
+
+    result = five_hour_utilization()
+    if result:
+        utilization, resets_at = result
+        local_reset = resets_at.astimezone()
+        print(f"  現在の5時間枠使用率: {utilization:.0f}% (回復: {local_reset:%H:%M})")
+
+
+def cmd_watchdog_cycle(args: argparse.Namespace) -> None:
+    """launchd から定期的に呼ばれる本体。人手では基本使わない。"""
+    run_watchdog_cycle()
+
+
 # ---------------------------------------------------------------------------
 # エントリポイント
 # ---------------------------------------------------------------------------
@@ -768,6 +1187,22 @@ def main() -> None:
     p_run = sub.add_parser("run", help="予約せず即座に実行する(動作確認用)")
     p_run.add_argument("job_file", help="ジョブ定義の TOML ファイル")
     p_run.set_defaults(func=cmd_run)
+
+    p_wd_start = sub.add_parser(
+        "watchdog-start", help="レートリミット自動対応の定期監視を開始する"
+    )
+    p_wd_start.set_defaults(func=cmd_watchdog_start)
+
+    p_wd_stop = sub.add_parser("watchdog-stop", help="定期監視を停止する")
+    p_wd_stop.set_defaults(func=cmd_watchdog_stop)
+
+    p_wd_status = sub.add_parser("watchdog-status", help="定期監視の状態を確認する")
+    p_wd_status.set_defaults(func=cmd_watchdog_status)
+
+    p_wd_cycle = sub.add_parser(
+        "watchdog-cycle", help="監視を1回だけ実行する(launchdから呼ばれる内部用)"
+    )
+    p_wd_cycle.set_defaults(func=cmd_watchdog_cycle)
 
     args = parser.parse_args()
 
