@@ -62,11 +62,20 @@ class ExistingTmuxJobTests(unittest.TestCase):
             patch.object(autoprompt, "STATE_DIR", state_directory),
             patch.object(autoprompt, "LOG_DIR", log_directory),
         ):
-            runner = autoprompt.write_runner(job)
+            runner = autoprompt.write_runner(
+                job,
+                tmux_identity={
+                    "pane_id": "%12",
+                    "pane_pid": "12345",
+                    "pane_start_command": "claude",
+                    "session_id": "$3",
+                    "window_id": "@8",
+                },
+            )
             script = runner.read_text(encoding="utf-8")
             prompt_snapshot = autoprompt.prompt_path_for(job.name)
 
-        self.assertIn('TARGET=research:1.2', script)
+        self.assertIn('TARGET=%12', script)
         self.assertIn("display-message", script)
         self.assertIn("capture-pane", script)
         self.assertIn("paste-buffer", script)
@@ -228,6 +237,44 @@ class ExistingTmuxJobTests(unittest.TestCase):
         ):
             autoprompt.cmd_send(args)
         send_prompt.assert_called_once_with("%7", "続けて")
+
+    def test_codex_handoff_never_embeds_captured_screen_in_shell_command(self) -> None:
+        captured_screen = "malicious $(touch /tmp/should-not-run) ' \"\n"
+        safe_runner = self.root / "handoff.runner.sh"
+        with (
+            patch.object(autoprompt, "tmux_capture", return_value=captured_screen),
+            patch.object(autoprompt, "tmux_send_prompt") as send_prompt,
+            patch.object(autoprompt, "tmux_pane_current_command", return_value="zsh"),
+            patch.object(
+                autoprompt,
+                "_write_codex_handoff_runner",
+                return_value=safe_runner,
+            ),
+            patch.object(autoprompt.subprocess, "run") as run,
+            patch.object(autoprompt.time, "sleep"),
+            patch.object(autoprompt, "watchdog_log"),
+        ):
+            result = autoprompt.handoff_to_codex("job", "%12")
+
+        self.assertTrue(result)
+        send_prompt.assert_called_once_with("%12", "/exit")
+        literal_command = run.call_args_list[0].args[0][-1]
+        self.assertEqual(literal_command, f"exec {safe_runner}")
+        self.assertNotIn(captured_screen, literal_command)
+
+    def test_codex_handoff_stops_if_claude_does_not_exit(self) -> None:
+        with (
+            patch.object(autoprompt, "tmux_capture", return_value="screen"),
+            patch.object(autoprompt, "tmux_send_prompt"),
+            patch.object(autoprompt, "tmux_pane_current_command", return_value="claude"),
+            patch.object(autoprompt.subprocess, "run") as run,
+            patch.object(autoprompt.time, "sleep"),
+            patch.object(autoprompt, "watchdog_log"),
+        ):
+            result = autoprompt.handoff_to_codex("job", "%12")
+
+        self.assertFalse(result)
+        run.assert_not_called()
 
 
 if __name__ == "__main__":
