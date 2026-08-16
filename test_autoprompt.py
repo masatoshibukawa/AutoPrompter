@@ -112,6 +112,15 @@ class ExistingTmuxJobTests(unittest.TestCase):
         ):
             self.assertFalse(autoprompt.tmux_target_is_idle("%12", samples=2))
 
+        historical_prompt = "❯\n" + "\n".join(
+            f"確認ダイアログ {index}" for index in range(12)
+        )
+        with (
+            patch.object(autoprompt, "tmux_capture", return_value=historical_prompt),
+            patch.object(autoprompt.time, "sleep"),
+        ):
+            self.assertFalse(autoprompt.tmux_target_is_idle("%12", samples=2))
+
     def test_multiline_prompt_uses_one_unique_tmux_buffer(self) -> None:
         loaded_prompt = []
 
