@@ -129,6 +129,14 @@ class ExistingTmuxJobTests(unittest.TestCase):
         ):
             self.assertFalse(autoprompt.tmux_target_is_idle("%12", samples=2))
 
+    def test_idle_check_accepts_claude_non_breaking_space_prompt(self) -> None:
+        claude_empty_prompt = "❯\u00a0\n"
+        with (
+            patch.object(autoprompt, "tmux_capture", return_value=claude_empty_prompt),
+            patch.object(autoprompt.time, "sleep"),
+        ):
+            self.assertTrue(autoprompt.tmux_target_is_idle("%12", samples=2))
+
         with (
             patch.object(autoprompt, "tmux_capture", return_value="❯ 下書き\n"),
             patch.object(autoprompt.time, "sleep"),
