@@ -373,13 +373,28 @@ def tmux_target_exists(target: str) -> bool:
     return tmux_resolve_target(target) is not None
 
 
-_EMPTY_AGENT_INPUT_RE = re.compile(r"^[❯›][ \t]*$", re.MULTILINE)
+_EMPTY_AGENT_INPUT_RE = re.compile(r"^[❯›][^\S\r\n]*$", re.MULTILINE)
 
 
-def _has_recent_empty_agent_input(screen: str) -> bool:
+def _has_empty_agent_input_at_cursor(screen: str, cursor_y: int) -> bool:
+    """tmuxの現在カーソル行がClaude/Codexの空入力欄ならTrueを返す。"""
     lines = screen.splitlines()
-    nonempty_lines = [line for line in lines if line.strip()]
-    return bool(nonempty_lines and _EMPTY_AGENT_INPUT_RE.fullmatch(nonempty_lines[-1]))
+    if cursor_y < 0 or cursor_y >= len(lines):
+        return False
+    return _EMPTY_AGENT_INPUT_RE.fullmatch(lines[cursor_y]) is not None
+
+
+def tmux_pane_cursor_y(target: str) -> int | None:
+    """pane内の0始まりカーソル行を取得する。取得できなければNone。"""
+    result = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", target, "#{cursor_y}"],
+        capture_output=True,
+        text=True,
+    )
+    value = result.stdout.strip()
+    if result.returncode != 0 or not value.isdigit():
+        return None
+    return int(value)
 
 
 _TMUX_IDENTITY_FORMATS = {
@@ -430,14 +445,25 @@ def tmux_target_identity(target: str) -> dict[str, str] | None:
 def tmux_target_is_idle(target: str, samples: int = 3, interval: float = 2.0) -> bool:
     """画面が静止し、Claude/Codexの入力欄が空ならTrueを返す。"""
     previous_screen: str | None = None
+    previous_cursor_y: int | None = None
     for sample_index in range(samples):
         screen = tmux_capture(target)
-        if previous_screen is not None and screen != previous_screen:
+        cursor_y = tmux_pane_cursor_y(target)
+        if cursor_y is None:
+            return False
+        if previous_screen is not None and (
+            screen != previous_screen or cursor_y != previous_cursor_y
+        ):
             return False
         previous_screen = screen
+        previous_cursor_y = cursor_y
         if sample_index < samples - 1:
             time.sleep(interval)
-    return previous_screen is not None and _has_recent_empty_agent_input(previous_screen)
+    return (
+        previous_screen is not None
+        and previous_cursor_y is not None
+        and _has_empty_agent_input_at_cursor(previous_screen, previous_cursor_y)
+    )
 
 
 def _tmux_prompt_text(prompt: str) -> str:
@@ -742,9 +768,16 @@ if [ "$CURRENT_IDENTITY" != "$EXPECTED_IDENTITY" ]; then
 fi
 
 BEFORE=$(tmux capture-pane -p -t "$PANE")
+BEFORE_CURSOR_Y=$(tmux display-message -p -t "$PANE" '#{{cursor_y}}' 2>/dev/null)
 sleep 2
 AFTER=$(tmux capture-pane -p -t "$PANE")
-if [ "$BEFORE" != "$AFTER" ] || ! printf '%s\\n' "$AFTER" | sed '/^[[:space:]]*$/d' | tail -n 1 | grep -Eq '^[❯›][[:space:]]*$'; then
+AFTER_CURSOR_Y=$(tmux display-message -p -t "$PANE" '#{{cursor_y}}' 2>/dev/null)
+AFTER_CURRENT_COMMAND=$(tmux display-message -p -t "$PANE" '#{{pane_current_command}}' 2>/dev/null)
+case "$AFTER_CURSOR_Y" in
+  ''|*[!0-9]*) CURSOR_LINE='' ;;
+  *) CURSOR_LINE=$(printf '%s\\n' "$AFTER" | awk -v row="$((AFTER_CURSOR_Y + 1))" 'NR == row {{ print; exit }}') ;;
+esac
+if [ "$BEFORE" != "$AFTER" ] || [ "$BEFORE_CURSOR_Y" != "$AFTER_CURSOR_Y" ] || [ "$PANE_CURRENT_COMMAND" != "$AFTER_CURRENT_COMMAND" ] || ! printf '%s\\n' "$CURSOR_LINE" | LC_ALL=C tr '\\302\\240' '  ' | LC_ALL=C grep -Eq '^(❯|›)[[:space:]]*$'; then
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] 中断: $PANE は生成中、入力済み、または入力待ちを確認できません" >> "$LOG"
   printf '{{"name":"{job.name}","status":"blocked","mode":"existing_tmux","tmux_target":"%s","updated_at":"%s"}}' "$PANE" "$(date -Iseconds)" > "$STATE"
   exit 1
@@ -1361,9 +1394,14 @@ def cmd_send(args: argparse.Namespace) -> None:
                 f"{pane_id}が空の入力待ちであることを確認できません。"
                 "生成中や入力途中の可能性があります。確認後、必要なら--forceを指定してください"
             )
-        final_command = tmux_pane_current_command(pane_id)
         final_screen = tmux_capture(pane_id)
-        if final_command != initial_command or not _has_recent_empty_agent_input(final_screen):
+        final_cursor_y = tmux_pane_cursor_y(pane_id)
+        final_command = tmux_pane_current_command(pane_id)
+        if (
+            final_command != initial_command
+            or final_cursor_y is None
+            or not _has_empty_agent_input_at_cursor(final_screen, final_cursor_y)
+        ):
             die(f"{pane_id}の状態が確認中に変化したため、送信を中止しました")
     tmux_send_prompt(pane_id, prompt)
     print(f"投入しました: {args.target} -> {pane_id}（{len(prompt)}文字）")

@@ -92,7 +92,7 @@ class ExistingTmuxJobTests(unittest.TestCase):
         self.assertEqual(prompt_snapshot.read_text(encoding="utf-8"), "1行目\\\n2行目")
         self.assertEqual(stat.S_IMODE(prompt_snapshot.stat().st_mode), 0o600)
 
-    def test_existing_tmux_runner_accepts_non_breaking_space_prompt(self) -> None:
+    def test_existing_tmux_runner_accepts_nbsp_and_rechecks_command(self) -> None:
         job = autoprompt.Job(
             {
                 "name": "nbsp-prompt",
@@ -125,7 +125,18 @@ case "$1" in
       *'#{pane_id}'*) printf '%s\\n' '%12' ;;
       *'#{pane_pid}'*) printf '%s\\n' '12345' ;;
       *'#{pane_start_command}'*) printf '%s\\n' 'claude' ;;
-      *'#{pane_current_command}'*) printf '%s\\n' '2.1.233' ;;
+      *'#{pane_current_command}'*)
+        if [ -n "$AUTOPROMPTER_TEST_COMMAND_STATE" ]; then
+          if [ -f "$AUTOPROMPTER_TEST_COMMAND_STATE" ]; then
+            printf '%s\\n' 'zsh'
+          else
+            : > "$AUTOPROMPTER_TEST_COMMAND_STATE"
+            printf '%s\\n' '2.1.233'
+          fi
+        else
+          printf '%s\\n' '2.1.233'
+        fi
+        ;;
       *'#{session_id}'*) printf '%s\\n' '$3' ;;
       *'#{window_id}'*) printf '%s\\n' '@8' ;;
       *'#{cursor_y}'*) printf '%s\\n' '2' ;;
@@ -165,6 +176,27 @@ esac
 
         self.assertEqual(completed.returncode, 0)
         self.assertIn('"status":"sent"', state_path.read_text(encoding="utf-8"))
+
+        command_state = self.root / "command-state"
+        with (
+            patch.object(autoprompt, "STATE_DIR", state_directory),
+            patch.object(autoprompt, "LOG_DIR", log_directory),
+        ):
+            runner = autoprompt.write_runner(job, tmux_identity=identity)
+        changed_environment = {
+            **environment,
+            "AUTOPROMPTER_TEST_COMMAND_STATE": str(command_state),
+        }
+        changed = subprocess.run(
+            ["/bin/zsh", str(runner)],
+            capture_output=True,
+            text=True,
+            env=changed_environment,
+            check=False,
+        )
+
+        self.assertEqual(changed.returncode, 1)
+        self.assertIn('"status":"blocked"', state_path.read_text(encoding="utf-8"))
 
     def test_tmux_target_is_resolved_to_stable_pane_id(self) -> None:
         completed = subprocess.CompletedProcess([], 0, stdout="%12\n", stderr="")
@@ -357,6 +389,26 @@ esac
             autoprompt.cmd_send(args)
         send_prompt.assert_not_called()
 
+        args.force = True
+        with (
+            patch.object(autoprompt, "tmux_resolve_target", return_value="%7"),
+            patch.object(autoprompt, "tmux_pane_current_command", return_value="zsh"),
+            patch.object(autoprompt, "tmux_send_prompt") as send_prompt,
+        ):
+            autoprompt.cmd_send(args)
+        send_prompt.assert_called_once_with("%7", "続けて")
+
+        args.force = False
+        with (
+            patch.object(autoprompt, "tmux_resolve_target", return_value="%7"),
+            patch.object(autoprompt, "tmux_pane_current_command", return_value="zsh"),
+            patch.object(autoprompt, "tmux_target_is_idle", return_value=True),
+            patch.object(autoprompt, "tmux_send_prompt") as send_prompt,
+            self.assertRaises(SystemExit),
+        ):
+            autoprompt.cmd_send(args)
+        send_prompt.assert_not_called()
+
     def test_cmd_send_rechecks_cursor_line_before_sending(self) -> None:
         args = argparse.Namespace(
             target="research:1.2",
@@ -406,20 +458,23 @@ esac
                 autoprompt.cmd_send(args)
             send_prompt.assert_not_called()
 
-        args.force = True
+    def test_cmd_send_rejects_command_change_before_sending(self) -> None:
+        args = argparse.Namespace(
+            target="research:1.2",
+            prompt="続けて",
+            prompt_file=None,
+            force=False,
+        )
         with (
             patch.object(autoprompt, "tmux_resolve_target", return_value="%7"),
-            patch.object(autoprompt, "tmux_pane_current_command", return_value="zsh"),
-            patch.object(autoprompt, "tmux_send_prompt") as send_prompt,
-        ):
-            autoprompt.cmd_send(args)
-        send_prompt.assert_called_once_with("%7", "続けて")
-
-        args.force = False
-        with (
-            patch.object(autoprompt, "tmux_resolve_target", return_value="%7"),
-            patch.object(autoprompt, "tmux_pane_current_command", return_value="zsh"),
             patch.object(autoprompt, "tmux_target_is_idle", return_value=True),
+            patch.object(
+                autoprompt,
+                "tmux_pane_current_command",
+                side_effect=["2.1.233", "zsh"],
+            ),
+            patch.object(autoprompt, "tmux_capture", return_value="❯\u00a0\n"),
+            patch.object(autoprompt, "tmux_pane_cursor_y", return_value=0),
             patch.object(autoprompt, "tmux_send_prompt") as send_prompt,
             self.assertRaises(SystemExit),
         ):
