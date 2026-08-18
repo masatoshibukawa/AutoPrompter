@@ -1,4 +1,5 @@
 import argparse
+import os
 import stat
 import subprocess
 import tempfile
@@ -90,6 +91,75 @@ class ExistingTmuxJobTests(unittest.TestCase):
         self.assertNotIn("1行目", script)
         self.assertEqual(prompt_snapshot.read_text(encoding="utf-8"), "1行目\\\n2行目")
         self.assertEqual(stat.S_IMODE(prompt_snapshot.stat().st_mode), 0o600)
+
+    def test_existing_tmux_runner_accepts_non_breaking_space_prompt(self) -> None:
+        job = autoprompt.Job(
+            {
+                "name": "nbsp-prompt",
+                "cwd": None,
+                "tmux_target": "research:1.2",
+                "prompt": "続きを実行してください",
+            },
+            self.root / "nbsp-prompt.toml",
+        )
+        state_directory = self.root / "nbsp-state"
+        log_directory = self.root / "nbsp-logs"
+        binary_directory = self.root / "bin"
+        state_directory.mkdir()
+        log_directory.mkdir()
+        binary_directory.mkdir()
+        identity = {
+            "pane_id": "%12",
+            "pane_pid": "12345",
+            "pane_start_command": "claude",
+            "pane_current_command": "2.1.233",
+            "session_id": "$3",
+            "window_id": "@8",
+        }
+        fake_tmux = binary_directory / "tmux"
+        fake_tmux.write_text(
+            """#!/bin/sh
+case "$1" in
+  display-message)
+    case "$*" in
+      *'#{pane_id}'*) printf '%s\\n' '%12' ;;
+      *'#{pane_pid}'*) printf '%s\\n' '12345' ;;
+      *'#{pane_start_command}'*) printf '%s\\n' 'claude' ;;
+      *'#{pane_current_command}'*) printf '%s\\n' '2.1.233' ;;
+      *'#{session_id}'*) printf '%s\\n' '$3' ;;
+      *'#{window_id}'*) printf '%s\\n' '@8' ;;
+      *'#{cursor_y}'*) printf '%s\\n' '2' ;;
+    esac
+    ;;
+  capture-pane) printf 'header\\n────────\\n❯\\302\\240\\n────────\\nstatus\\n' ;;
+  *) exit 0 ;;
+esac
+""",
+            encoding="utf-8",
+        )
+        fake_tmux.chmod(0o700)
+        fake_sleep = binary_directory / "sleep"
+        fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_sleep.chmod(0o700)
+
+        with (
+            patch.object(autoprompt, "STATE_DIR", state_directory),
+            patch.object(autoprompt, "LOG_DIR", log_directory),
+        ):
+            runner = autoprompt.write_runner(job, tmux_identity=identity)
+            state_path = autoprompt.state_path_for(job.name)
+
+        environment = {**os.environ, "PATH": f"{binary_directory}:{os.environ['PATH']}"}
+        completed = subprocess.run(
+            ["/bin/zsh", str(runner)],
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertIn('"status":"sent"', state_path.read_text(encoding="utf-8"))
 
     def test_tmux_target_is_resolved_to_stable_pane_id(self) -> None:
         completed = subprocess.CompletedProcess([], 0, stdout="%12\n", stderr="")
