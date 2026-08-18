@@ -149,7 +149,12 @@ esac
             runner = autoprompt.write_runner(job, tmux_identity=identity)
             state_path = autoprompt.state_path_for(job.name)
 
-        environment = {**os.environ, "PATH": f"{binary_directory}:{os.environ['PATH']}"}
+        environment = {
+            **os.environ,
+            "PATH": f"{binary_directory}:{os.environ['PATH']}",
+            "LANG": "C",
+            "LC_ALL": "C",
+        }
         completed = subprocess.run(
             ["/bin/zsh", str(runner)],
             capture_output=True,
@@ -173,6 +178,16 @@ esac
             text=True,
         )
 
+    def test_tmux_cursor_y_is_parsed_and_invalid_output_is_rejected(self) -> None:
+        valid = subprocess.CompletedProcess([], 0, stdout="61\n", stderr="")
+        invalid = subprocess.CompletedProcess([], 0, stdout="unknown\n", stderr="")
+        with patch.object(autoprompt.subprocess, "run", side_effect=[valid, invalid]):
+            self.assertEqual(autoprompt.tmux_pane_cursor_y("research:1.2"), 61)
+            self.assertIsNone(autoprompt.tmux_pane_cursor_y("research:1.2"))
+
+    def test_cursor_outside_capture_is_not_an_empty_input(self) -> None:
+        self.assertFalse(autoprompt._has_empty_agent_input_at_cursor("❯\n", 1))
+
     def test_tmux_identity_allows_empty_start_command_for_manual_session(self) -> None:
         outputs = ["%12\n", "12345\n", "\n", "2.1.233\n", "$3\n", "@8\n"]
         completed = [
@@ -188,6 +203,7 @@ esac
     def test_idle_check_requires_static_empty_agent_input(self) -> None:
         with (
             patch.object(autoprompt, "tmux_capture", side_effect=["❯  \n", "❯  \n"]),
+            patch.object(autoprompt, "tmux_pane_cursor_y", return_value=0),
             patch.object(autoprompt.time, "sleep") as sleep,
         ):
             self.assertTrue(autoprompt.tmux_target_is_idle("%12", samples=2))
@@ -195,6 +211,14 @@ esac
 
         with (
             patch.object(autoprompt, "tmux_capture", side_effect=["❯\n", "working\n"]),
+            patch.object(autoprompt, "tmux_pane_cursor_y", return_value=0),
+            patch.object(autoprompt.time, "sleep"),
+        ):
+            self.assertFalse(autoprompt.tmux_target_is_idle("%12", samples=2))
+
+        with (
+            patch.object(autoprompt, "tmux_capture", return_value="❯\nstatus\n"),
+            patch.object(autoprompt, "tmux_pane_cursor_y", side_effect=[0, 1]),
             patch.object(autoprompt.time, "sleep"),
         ):
             self.assertFalse(autoprompt.tmux_target_is_idle("%12", samples=2))
@@ -203,12 +227,14 @@ esac
         claude_empty_prompt = "❯\u00a0\n"
         with (
             patch.object(autoprompt, "tmux_capture", return_value=claude_empty_prompt),
+            patch.object(autoprompt, "tmux_pane_cursor_y", return_value=0),
             patch.object(autoprompt.time, "sleep"),
         ):
             self.assertTrue(autoprompt.tmux_target_is_idle("%12", samples=2))
 
         with (
             patch.object(autoprompt, "tmux_capture", return_value="❯ 下書き\n"),
+            patch.object(autoprompt, "tmux_pane_cursor_y", return_value=0),
             patch.object(autoprompt.time, "sleep"),
         ):
             self.assertFalse(autoprompt.tmux_target_is_idle("%12", samples=2))
@@ -216,6 +242,7 @@ esac
         historical_prompt = "❯\n確認ダイアログ"
         with (
             patch.object(autoprompt, "tmux_capture", return_value=historical_prompt),
+            patch.object(autoprompt, "tmux_pane_cursor_y", return_value=1),
             patch.object(autoprompt.time, "sleep"),
         ):
             self.assertFalse(autoprompt.tmux_target_is_idle("%12", samples=2))
@@ -253,6 +280,11 @@ esac
         self.assertIn("#{pane_pid}", script)
         self.assertIn("#{pane_start_command}", script)
         self.assertIn("#{pane_current_command}", script)
+        self.assertIn("AFTER_CURRENT_COMMAND", script)
+        self.assertIn(
+            '[ "$PANE_CURRENT_COMMAND" != "$AFTER_CURRENT_COMMAND" ]',
+            script,
+        )
         self.assertIn("#{session_id}", script)
         self.assertIn("#{window_id}", script)
         self.assertIn("%12|12345|claude|2.1.233|$3|@8", script)
@@ -324,6 +356,55 @@ esac
         ):
             autoprompt.cmd_send(args)
         send_prompt.assert_not_called()
+
+    def test_cmd_send_rechecks_cursor_line_before_sending(self) -> None:
+        args = argparse.Namespace(
+            target="research:1.2",
+            prompt="続けて",
+            prompt_file=None,
+            force=False,
+        )
+        final_screen = "header\n❯\u00a0\nstatus\n"
+        with (
+            patch.object(autoprompt, "tmux_resolve_target", return_value="%7"),
+            patch.object(autoprompt, "tmux_target_is_idle", return_value=True),
+            patch.object(
+                autoprompt,
+                "tmux_pane_current_command",
+                side_effect=["2.1.233", "2.1.233"],
+            ),
+            patch.object(autoprompt, "tmux_capture", return_value=final_screen),
+            patch.object(autoprompt, "tmux_pane_cursor_y", return_value=1),
+            patch.object(autoprompt, "tmux_send_prompt") as send_prompt,
+        ):
+            autoprompt.cmd_send(args)
+
+        send_prompt.assert_called_once_with("%7", "続けて")
+
+    def test_cmd_send_rejects_invalid_final_cursor(self) -> None:
+        args = argparse.Namespace(
+            target="research:1.2",
+            prompt="続けて",
+            prompt_file=None,
+            force=False,
+        )
+        for cursor_y in (None, 99):
+            with (
+                self.subTest(cursor_y=cursor_y),
+                patch.object(autoprompt, "tmux_resolve_target", return_value="%7"),
+                patch.object(autoprompt, "tmux_target_is_idle", return_value=True),
+                patch.object(
+                    autoprompt,
+                    "tmux_pane_current_command",
+                    side_effect=["2.1.233", "2.1.233"],
+                ),
+                patch.object(autoprompt, "tmux_capture", return_value="❯\u00a0\n"),
+                patch.object(autoprompt, "tmux_pane_cursor_y", return_value=cursor_y),
+                patch.object(autoprompt, "tmux_send_prompt") as send_prompt,
+                self.assertRaises(SystemExit),
+            ):
+                autoprompt.cmd_send(args)
+            send_prompt.assert_not_called()
 
         args.force = True
         with (
