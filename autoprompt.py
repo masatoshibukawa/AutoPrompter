@@ -839,6 +839,13 @@ def write_runner(
     quoted_state = shlex.quote(str(state_path_for(job.name)))
     quoted_prompt = shlex.quote(str(prompt_snapshot))
 
+    # on_rate_limit / rate_limit_threshold は起動成功後に書く state JSON にも
+    # 引き継ぐ必要がある。ここで落とすと、launchd 起動後は watchdog が
+    # このジョブを見つけられなくなる(state ファイルは on_rate_limit を見るコード
+    # しかない)。値は登録時点で確定しているので Python 側で JSON 化して埋め込む。
+    quoted_on_rate_limit = shlex.quote(json.dumps(job.on_rate_limit))
+    rate_limit_threshold_literal = json.dumps(job.rate_limit_threshold)
+
     script = f"""#!/bin/zsh -l
 # AutoPrompter runner (自動生成 - 直接編集しないこと)
 # ジョブ: {job.name}
@@ -877,12 +884,15 @@ tmux new-session -d -s "$SESSION" -x 200 -y 50 -c {quoted_cwd} \\
   {claude_cmd} "$(cat "$PROMPT")"
 rc=$?
 
+ON_RATE_LIMIT={quoted_on_rate_limit}
+RATE_LIMIT_THRESHOLD={rate_limit_threshold_literal}
+
 if [ $rc -eq 0 ]; then
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] 起動成功: tmux attach -t $SESSION で合流できます" >> "$LOG"
-  printf '%s' "{{\\"name\\": \\"{job.name}\\", \\"status\\": \\"launched\\", \\"session\\": \\"$SESSION\\", \\"launched_at\\": \\"$(date -Iseconds)\\"}}" > "$STATE"
+  printf '%s' "{{\\"name\\": \\"{job.name}\\", \\"status\\": \\"launched\\", \\"session\\": \\"$SESSION\\", \\"launched_at\\": \\"$(date -Iseconds)\\", \\"on_rate_limit\\": $ON_RATE_LIMIT, \\"rate_limit_threshold\\": $RATE_LIMIT_THRESHOLD}}" > "$STATE"
 else
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] 失敗: tmux new-session が rc=$rc で終了" >> "$LOG"
-  printf '%s' "{{\\"name\\": \\"{job.name}\\", \\"status\\": \\"failed\\", \\"launched_at\\": \\"$(date -Iseconds)\\"}}" > "$STATE"
+  printf '%s' "{{\\"name\\": \\"{job.name}\\", \\"status\\": \\"failed\\", \\"launched_at\\": \\"$(date -Iseconds)\\", \\"on_rate_limit\\": $ON_RATE_LIMIT, \\"rate_limit_threshold\\": $RATE_LIMIT_THRESHOLD}}" > "$STATE"
 fi
 
 exit $rc
